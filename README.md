@@ -52,6 +52,36 @@ Siehe Plugin-Header in `dispatch-dashboard.php` für detaillierte Änderungshist
 
 Klaus Arends (klaus.arends@yahoo.es)
 
+## Auto-Commit Script
+
+Das Repository enthält ein automatisches Backup-Script (`auto-commit.sh`), das:
+- Die neueste Version vom FTP-Server herunterlädt
+- Änderungen automatisch committed
+- Zu GitHub pusht
+
+### Einrichtung
+
+1. Kopiere `.env.example` zu `.env`:
+   ```bash
+   cp .env.example .env
+   ```
+
+2. Bearbeite `.env` und trage deine Credentials ein:
+   - FTP-Zugangsdaten
+   - GitHub Personal Access Token
+
+3. Führe das Script aus:
+   ```bash
+   ./auto-commit.sh
+   ```
+
+### Automatische Backups
+
+Du kannst das Script über einen Cron-Job automatisch ausführen lassen, z.B. täglich um 2 Uhr:
+```bash
+0 2 * * * /tmp/dispatch-secure-plugin/auto-commit.sh >> /tmp/dispatch-backup.log 2>&1
+```
+
 ## Lizenz
 
 GPL v2 or later
