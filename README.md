@@ -1,4 +1,4 @@
-# Dispatch SECURE Plugin v2.9.74
+# Dispatch SECURE Plugin v3.1.0
 
 WordPress/WooCommerce Plugin für Lieferfahrer-Management, Routing und Kundenbenachrichtigungen.
 
@@ -23,6 +23,13 @@ WordPress/WooCommerce Plugin für Lieferfahrer-Management, Routing und Kundenben
 - Routing-Karte mit allen Bestellungen
 - Customer Tracking mit Echtzeit-Position
 
+### Plus Code LPAC-Kompatibilität (v3.1.0)
+- **Vollständige LPAC-Integration** für automatische KM/ETA-Anzeige
+- Speichert alle LPAC-spezifischen Meta-Keys automatisch
+- KM/ETA werden auf WooCommerce Orders-Seite angezeigt
+- Dual-Path Support (OSRM + Haversine Fallback)
+- **Kein MU-Plugin mehr erforderlich**
+
 ### SMS-Unterdrückung (v2.9.51)
 - Suppression-Flag blockiert nur SMS/WhatsApp
 - E-Mails werden weiterhin versendet
@@ -39,14 +46,19 @@ WordPress/WooCommerce Plugin für Lieferfahrer-Management, Routing und Kundenben
 - WordPress 6.0+
 - WooCommerce 8.0+
 - PHP 8.3+
+- **LPAC - Kikote Location Picker at Checkout** (optional, für KM/ETA-Anzeige auf Orders-Seite)
+
+## Distribution
+
+Siehe [DISTRIBUTION-ANLEITUNG.md](DISTRIBUTION-ANLEITUNG.md) für Details zur Plugin-Weitergabe an Kunden.
 
 ## Version
 
-Aktuelle Version: **2.9.74** (2025-11-20)
+Aktuelle Version: **3.1.0** (2025-11-21) - Plus Code LPAC-Kompatibilität
 
 ## Changelog
 
-Siehe Plugin-Header in `dispatch-dashboard.php` für detaillierte Änderungshistorie.
+Siehe [CHANGELOG.md](CHANGELOG.md) für detaillierte Änderungshistorie.
 
 ## Autor
 
