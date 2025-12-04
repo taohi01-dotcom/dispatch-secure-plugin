@@ -2,6 +2,26 @@
 
 Alle wichtigen Änderungen am Dispatch SECURE Plugin werden hier dokumentiert.
 
+---
+
+## ⚠️ TODO: Test-Dateien löschen
+
+**Nach dem Testen bitte folgende Dateien vom Server entfernen:**
+
+```
+https://entregamos-bebidas.es/sumup-test.php
+https://entregamos-bebidas.es/sumup-test-android.php
+```
+
+**Löschen per FTP oder mit diesem Befehl:**
+```bash
+curl -u f017dbe9:PASSWORD "ftp://w019704b.kasserver.com/" -Q "DELE sumup-test.php" -Q "DELE sumup-test-android.php"
+```
+
+Diese Test-Seiten wurden am 04.12.2025 erstellt, um die SumUp Android-Integration zu testen.
+
+---
+
 ## [2.9.76] - 2025-12-04
 
 ### SMS Festnetz-Erkennung
