@@ -2,6 +2,29 @@
 
 Alle wichtigen Änderungen am Dispatch SECURE Plugin werden hier dokumentiert.
 
+## [2.9.76] - 2025-12-04
+
+### SMS Festnetz-Erkennung
+
+#### 📱 Automatische Festnetz-Erkennung
+- **Neue Funktion `isLandlineNumber()`** erkennt Festnetznummern vor SMS-Versand
+- **Unterstützte Länder:**
+  - 🇪🇸 Spanien: 8xx/9xx Vorwahlen (z.B. 971 Balearen)
+  - 🇩🇪 Deutschland: Alle Nicht-Mobil +49 Nummern
+  - 🇬🇧 Großbritannien: 01x/02x/03x Vorwahlen
+  - 🇫🇷 Frankreich: 1-5 Vorwahlen
+
+#### ✅ Verbesserungen
+- **SMS wird automatisch übersprungen** wenn Festnetz erkannt
+- **Klare Warnung im Log:** `⚠️ Übersprungen - Spanische Festnetznummer`
+- **Keine Twilio-Fehler mehr:** "cannot be a landline" wird verhindert
+- **Kosten gespart:** Keine unnötigen API-Aufrufe für Festnetznummern
+
+#### 📁 Geänderte Dateien
+- `dispatch-dashboard.php` (Zeilen 13798-13864)
+
+---
+
 ## [2.9.75] - 2025-12-04
 
 ### SumUp Android Fix & Packliste Pfandtyp
