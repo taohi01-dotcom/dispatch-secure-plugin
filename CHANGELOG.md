@@ -2,6 +2,40 @@
 
 Alle wichtigen Änderungen am Dispatch SECURE Plugin werden hier dokumentiert.
 
+## [2.9.75] - 2025-12-04
+
+### SumUp Android Fix & Packliste Pfandtyp
+
+#### 🔧 SumUp Tap to Pay - Android Kompatibilität
+- **Plattform-Erkennung** hinzugefügt (iOS vs Android)
+- **Android URL-Scheme korrigiert:**
+  - `app-id=com.sumup.merchant` Parameter hinzugefügt
+  - `total` statt `amount` für Beträge (Android-spezifisch)
+  - Einzelner `callback` Parameter statt `callbacksuccess`/`callbackfail`
+- **Android Callback-Handler:**
+  - Verarbeitet `smp-status=success/failed` Parameter
+  - Zeigt `smp-message` bei Fehlern an
+- **Ergebnis:** SumUp Tap to Pay funktioniert jetzt auf Android-Geräten
+
+#### ✨ Packliste - Pfandtyp Anzeige
+- **Neues Badge** in der Fahrer-Packliste
+  - Lila Hintergrund (#8B5CF6) mit ♻️ Symbol
+  - Zeigt Pfandtyp wie "Mehrweg" an
+- **Backend:**
+  - Liest `pa_pfandtyp` Produktattribut aus
+  - Unterstützt einfache Produkte und Variationen
+  - Fallback auf Parent-Produkt wenn nötig
+- **Badges in Packliste:**
+  - 📏 Blau - Größe/Liter
+  - 🍹 Grün - Geschmack
+  - 📦 Orange - Menge
+  - ♻️ Lila - Pfandtyp (NEU)
+
+#### 📁 Geänderte Dateien
+- `dispatch-dashboard.php` (Zeilen 14837-14883, 29670-29749, 31071-31174)
+
+---
+
 ## [3.1.0] - 2025-11-21
 
 ### Plus Code LPAC-Kompatibilität

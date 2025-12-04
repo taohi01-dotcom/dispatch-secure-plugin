@@ -1,13 +1,21 @@
 <?php
 /**
- * Plugin Name: Dispatch SECURE v2.9.74
+ * Plugin Name: Dispatch SECURE v2.9.75
  * Plugin URI: https://your-domain.de
  * Description: Enhanced routing map display & driver management improvements
- * Version: 2.9.74
+ * Version: 2.9.75
  * Author: Ihr Name
  * License: GPL v2 or later
  * Requires PHP: 8.3
  * Requires at least: 6.0
+ *
+ * SUMUP ANDROID FIX & PACKLISTE PFANDTYP v2.9.75 (2025-12-04):
+ * - FIXED: SumUp URL scheme now detects iOS vs Android platform
+ * - FIXED: Android uses correct parameters: app-id, total (not amount), single callback
+ * - FIXED: Android callback handler processes smp-status parameter correctly
+ * - ADDED: Pfandtyp (deposit type) attribute now displayed in Packliste
+ * - ADDED: Purple badge with ♻️ icon shows "Mehrweg" or other deposit types
+ * - IMPROVED: Better compatibility with SumUp Tap to Pay on Android devices
  *
  * METADATA SYNC FIX v2.9.74 (2025-11-19):
  * - FIXED: ajaxUpdateOrderStatus now cleans up metadata when "geladen" status is removed
@@ -841,6 +849,12 @@ class DispatchDashboard {
         add_action('wp_ajax_get_driver_packlist', [$this, 'ajaxGetDriverPacklist']);
         add_action('wp_ajax_get_product_image', [$this, 'ajaxGetProductImage']);
         add_action('wp_ajax_toggle_driver_online_status', [$this, 'ajaxToggleDriverOnlineStatus']);
+
+        // SumUp Tap to Pay AJAX Actions
+        add_action('wp_ajax_get_sumup_credentials', [$this, 'ajaxGetSumUpCredentials']);
+        add_action('wp_ajax_mark_sumup_payment', [$this, 'ajaxMarkSumUpPayment']);
+        add_action('wp_ajax_get_driver_sumup_key', [$this, 'ajaxGetDriverSumUpKey']);
+        add_action('wp_ajax_save_driver_sumup_key', [$this, 'ajaxSaveDriverSumUpKey']);
 
         // Mobile-specific toggle for Flutter app (no nonce required)
         add_action('wp_ajax_mobile_toggle_driver_status', [$this, 'ajaxMobileToggleDriverStatus']);
@@ -5178,6 +5192,127 @@ class DispatchDashboard {
     /**
      * AJAX: Get ready status for multiple orders
      */
+
+    public function ajaxGetDriverOrderStats(): void {
+        Dispatch_Security::verify_driver_access(true);
+
+        $driver_id = get_current_user_id();
+
+        // Zeitstempel für verschiedene Perioden
+        $today_start = strtotime('today 00:00:00');
+        $week_start = strtotime('monday this week 00:00:00');
+        $month_start = strtotime('first day of this month 00:00:00');
+
+        // Basis-Query für zugestellte Bestellungen
+        $base_args = [
+            'limit' => -1,
+            'status' => ['wc-completed'],
+            'meta_query' => [
+                [
+                    'key' => '_assigned_driver',
+                    'value' => $driver_id,
+                    'compare' => '='
+                ]
+            ]
+        ];
+
+        // HEUTE: Anzahl Lieferungen
+        $today_args = array_merge($base_args, [
+            'date_completed' => '>=' . $today_start,
+        ]);
+        $today_orders = wc_get_orders($today_args);
+        $today_count = count($today_orders);
+
+        // WOCHE: Anzahl Lieferungen
+        $week_args = array_merge($base_args, [
+            'date_completed' => '>=' . $week_start,
+        ]);
+        $week_orders = wc_get_orders($week_args);
+        $week_count = count($week_orders);
+
+        // MONAT: Anzahl Lieferungen
+        $month_args = array_merge($base_args, [
+            'date_completed' => '>=' . $month_start,
+        ]);
+        $month_orders = wc_get_orders($month_args);
+        $month_count = count($month_orders);
+
+        // GESAMT: Alle Lieferungen
+        $all_orders = wc_get_orders($base_args);
+        $total_count = count($all_orders);
+
+        // BEWERTUNGEN: Aus User Meta (bereits vorberechnet)
+        $average_rating = floatval(get_user_meta($driver_id, 'driver_rating_average', true));
+        $rating_count = intval(get_user_meta($driver_id, 'driver_rating_count', true));
+        $stars_5 = intval(get_user_meta($driver_id, 'driver_rating_stars_5', true));
+
+        // PERFORMANCE: Durchschnittliche Lieferzeit (nur heute für Performance)
+        $total_duration = 0;
+        $deliveries_with_time = 0;
+
+        foreach ($today_orders as $order) {
+            $ready_time = $order->get_meta('_order_ready_timestamp');
+            $delivered_time = $order->get_date_completed();
+
+            if ($ready_time && $delivered_time) {
+                $ready_timestamp = strtotime($ready_time);
+                $delivered_timestamp = $delivered_time->getTimestamp();
+                $duration = ($delivered_timestamp - $ready_timestamp) / 60; // in Minuten
+
+                if ($duration > 0 && $duration < 300) { // Nur sinnvolle Werte (< 5 Stunden)
+                    $total_duration += $duration;
+                    $deliveries_with_time++;
+                }
+            }
+        }
+
+        $avg_delivery_time = $deliveries_with_time > 0
+            ? round($total_duration / $deliveries_with_time)
+            : 0;
+
+        // Schnellste Lieferung heute
+        $fastest_delivery = 0;
+        foreach ($today_orders as $order) {
+            $ready_time = $order->get_meta('_order_ready_timestamp');
+            $delivered_time = $order->get_date_completed();
+
+            if ($ready_time && $delivered_time) {
+                $ready_timestamp = strtotime($ready_time);
+                $delivered_timestamp = $delivered_time->getTimestamp();
+                $duration = ($delivered_timestamp - $ready_timestamp) / 60;
+
+                if ($duration > 0 && $duration < 300) {
+                    if ($fastest_delivery === 0 || $duration < $fastest_delivery) {
+                        $fastest_delivery = round($duration);
+                    }
+                }
+            }
+        }
+
+        // PFAND: Summe aller zurückgegebenen Pfandbeträge
+        $total_pfand = 0;
+        foreach ($all_orders as $order) {
+            $pfand_amount = floatval($order->get_meta('_pfand_refund_amount'));
+            if ($pfand_amount > 0) {
+                $total_pfand += $pfand_amount;
+            }
+        }
+
+        // Response zusammenstellen
+        wp_send_json_success([
+            'today' => $today_count,
+            'week' => $week_count,
+            'month' => $month_count,
+            'total' => $total_count,
+            'rating_average' => $average_rating,
+            'rating_count' => $rating_count,
+            'stars_5' => $stars_5,
+            'avg_delivery_time' => $avg_delivery_time,
+            'fastest_delivery' => $fastest_delivery > 0 ? $fastest_delivery : null,
+            'total_pfand' => $total_pfand,
+        ]);
+    }
+
     public function ajaxGetOrdersReadyStatus(): void {
         // SECURITY PATCH v2.6.0: Admin-only access
         Dispatch_Security::verify_ajax_request('get_orders_ready_status', 'manage_woocommerce', true);
@@ -14707,6 +14842,40 @@ class DispatchDashboard {
                     }
                 }
 
+                // Get Pfandtyp (deposit type) from product attribute
+                $pfandtyp = '';
+                if ($product) {
+                    // First try to get from the product directly (for simple products)
+                    $parent_product = $product->is_type('variation') ? wc_get_product($product->get_parent_id()) : $product;
+
+                    if ($parent_product) {
+                        // Try to get Pfandtyp attribute
+                        $pfandtyp_attr = $parent_product->get_attribute('pa_pfandtyp');
+                        if (empty($pfandtyp_attr)) {
+                            $pfandtyp_attr = $parent_product->get_attribute('pfandtyp');
+                        }
+                        if (!empty($pfandtyp_attr)) {
+                            $pfandtyp = $pfandtyp_attr;
+                        }
+                    }
+
+                    // Also check variation attributes if it's a variation
+                    if (empty($pfandtyp) && $product->is_type('variation')) {
+                        $variation_attributes = $product->get_variation_attributes();
+                        if (isset($variation_attributes['attribute_pa_pfandtyp'])) {
+                            $pfandtyp_slug = $variation_attributes['attribute_pa_pfandtyp'];
+                            if (taxonomy_exists('pa_pfandtyp')) {
+                                $term = get_term_by('slug', $pfandtyp_slug, 'pa_pfandtyp');
+                                if ($term) {
+                                    $pfandtyp = $term->name;
+                                }
+                            } else {
+                                $pfandtyp = $pfandtyp_slug;
+                            }
+                        }
+                    }
+                }
+
                 $items[] = [
                     'id' => $item_id,
                     'name' => $item_name,
@@ -14714,6 +14883,7 @@ class DispatchDashboard {
                     'size' => $size_info,
                     'flavor' => $flavor_info,
                     'package_quantity' => $package_quantity,
+                    'pfandtyp' => $pfandtyp,
                     'sku' => $product ? $product->get_sku() : '',
                     'quantity' => $item->get_quantity(),
                     'total' => number_format($item->get_total(), 2, ',', '.') . ' €',
@@ -15127,7 +15297,13 @@ class DispatchDashboard {
             return;
         }
 
+        // First check user-specific key, then fall back to global option
         $affiliate_key = get_user_meta($user_id, 'sumup_affiliate_key', true);
+
+        if (empty($affiliate_key)) {
+            // Fall back to global SumUp Affiliate Key from admin settings
+            $affiliate_key = get_option('dispatch_sumup_affiliate_key', '');
+        }
 
         if (empty($affiliate_key)) {
             wp_send_json_error(['message' => 'SumUp Affiliate Key nicht konfiguriert']);
@@ -23012,6 +23188,206 @@ class DispatchDashboard {
                 }
                 
                 /* Bottom Navigation */
+                .stats-container-grid {
+                    padding: 20px;
+                    padding-bottom: 80px;
+                    background: #1a1a1a;
+                    min-height: calc(100vh - 60px);
+                    display: flex;
+                    flex-direction: column;
+                    gap: 20px;
+                }
+
+                /* 4-Card Grid */
+                .stats-grid {
+                    display: grid;
+                    grid-template-columns: repeat(2, 1fr);
+                    gap: 12px;
+                }
+
+                .stat-card {
+                    border-radius: 16px;
+                    padding: 20px;
+                    text-align: center;
+                    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+                    position: relative;
+                    overflow: hidden;
+                }
+
+                .stat-card::before {
+                    content: '';
+                    position: absolute;
+                    top: -50%;
+                    right: -50%;
+                    width: 200%;
+                    height: 200%;
+                    background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 70%);
+                    pointer-events: none;
+                }
+
+                .stat-card-blue {
+                    background: linear-gradient(135deg, #3B82F6 0%, #1E40AF 100%);
+                }
+
+                .stat-card-pink {
+                    background: linear-gradient(135deg, #EC4899 0%, #BE185D 100%);
+                }
+
+                .stat-card-cyan {
+                    background: linear-gradient(135deg, #06B6D4 0%, #0E7490 100%);
+                }
+
+                .stat-card-orange {
+                    background: linear-gradient(135deg, #F59E0B 0%, #D97706 100%);
+                }
+
+                .stat-icon {
+                    font-size: 36px;
+                    margin-bottom: 8px;
+                }
+
+                .stat-label {
+                    font-size: 11px;
+                    font-weight: 600;
+                    color: rgba(255, 255, 255, 0.9);
+                    letter-spacing: 1px;
+                    margin-bottom: 8px;
+                }
+
+                .stat-value {
+                    font-size: 36px;
+                    font-weight: 800;
+                    color: #ffffff;
+                    line-height: 1;
+                }
+
+                /* Chart Section */
+                .chart-section {
+                    background: linear-gradient(135deg, #2D3748 0%, #1a202c 100%);
+                    border-radius: 16px;
+                    padding: 20px;
+                    border: 1px solid #374151;
+                }
+
+                .chart-header {
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                    margin-bottom: 16px;
+                    padding-bottom: 12px;
+                    border-bottom: 1px solid #374151;
+                }
+
+                .chart-icon {
+                    font-size: 20px;
+                }
+
+                .chart-title {
+                    font-size: 16px;
+                    font-weight: 600;
+                    color: #ffffff;
+                }
+
+                .chart-bars {
+                    display: flex;
+                    flex-direction: column;
+                    gap: 14px;
+                }
+
+                .bar-row {
+                    display: flex;
+                    align-items: center;
+                    gap: 12px;
+                }
+
+                .bar-label {
+                    font-size: 13px;
+                    color: #9CA3AF;
+                    min-width: 50px;
+                    font-weight: 500;
+                }
+
+                .bar-container {
+                    flex: 1;
+                    height: 24px;
+                    background: #1F2937;
+                    border-radius: 12px;
+                    overflow: hidden;
+                    position: relative;
+                }
+
+                .bar {
+                    height: 100%;
+                    border-radius: 12px;
+                    transition: width 0.6s ease;
+                    min-width: 8px;
+                }
+
+                .bar-blue {
+                    background: linear-gradient(90deg, #3B82F6 0%, #60A5FA 100%);
+                }
+
+                .bar-pink {
+                    background: linear-gradient(90deg, #EC4899 0%, #F472B6 100%);
+                }
+
+                .bar-cyan {
+                    background: linear-gradient(90deg, #06B6D4 0%, #22D3EE 100%);
+                }
+
+                .bar-value {
+                    font-size: 14px;
+                    font-weight: 700;
+                    color: #ffffff;
+                    min-width: 30px;
+                    text-align: right;
+                }
+
+                /* Overview Section */
+                .overview-section {
+                    background: linear-gradient(135deg, #2D3748 0%, #1a202c 100%);
+                    border-radius: 16px;
+                    padding: 20px;
+                    border: 1px solid #374151;
+                }
+
+                .overview-header {
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                    margin-bottom: 16px;
+                    padding-bottom: 12px;
+                    border-bottom: 1px solid #374151;
+                }
+
+                .overview-icon {
+                    font-size: 20px;
+                }
+
+                .overview-title {
+                    font-size: 16px;
+                    font-weight: 600;
+                    color: #ffffff;
+                }
+
+                .overview-list {
+                    display: flex;
+                    flex-direction: column;
+                    gap: 12px;
+                }
+
+                .overview-item {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    padding: 8px 0;
+                }
+
+                .overview-label {
+                    font-size: 14px;
+                    color: #9CA3AF;
+                }
+
                 .bottom-navigation {
                     position: fixed;
                     bottom: 0;
@@ -23020,11 +23396,13 @@ class DispatchDashboard {
                     background: #2D3748;
                     border-top: 1px solid #4A5568;
                     display: flex;
-                    justify-content: space-around;
-                    height: 56px;
+                    justify-content: space-evenly;
+                    gap: 8px;
+                    height: 62px;
                     align-items: center;
+                    padding: 0 10px 8px 10px;
                 }
-                
+
                 .nav-item {
                     display: flex;
                     flex-direction: column;
@@ -23032,22 +23410,22 @@ class DispatchDashboard {
                     text-decoration: none;
                     color: #48BB78;
                     transition: color 0.3s ease;
-                    padding: 5px 10px;
+                    padding: 6px 2px;
                 }
-                
+
                 .nav-item.active {
                     color: #48BB78;
                 }
-                
+
                 .nav-item:hover {
                     color: #48BB78;
                 }
-                
+
                 .nav-item .icon {
                     font-size: 20px;
-                    margin-bottom: 3px;
+                    margin-bottom: 2px;
                 }
-                
+
                 .nav-item .label {
                     font-size: 11px;
                 }
@@ -23176,8 +23554,8 @@ class DispatchDashboard {
                 .menu-link {
                     display: flex;
                     align-items: center;
-                    gap: 12px;
-                    padding: 14px 20px;
+                    gap: 10px;
+                    padding: 10px 20px;
                     color: #cbd5e1;
                     text-decoration: none;
                     font-size: 15px;
@@ -24769,7 +25147,17 @@ class DispatchDashboard {
                     // Login page
                     loginError: 'FEHLER: Benutzername oder Passwort ist falsch. Bitte versuchen Sie es erneut.',
                     loginPlaceholder: 'E-Mail oder Benutzername',
-                    forgotPassword: 'Passwort vergessen?'
+                    forgotPassword: 'Passwort vergessen?',
+
+                    // Performance Statistics
+                    thisWeek: 'DIESE WOCHE',
+                    thisMonth: 'DIESEN MONAT',
+                    development: 'Entwicklung',
+                    performanceOverview: 'Leistungsübersicht',
+                    totalDeliveries: 'Gesamt Lieferungen',
+                    successRate: 'Erfolgsrate',
+                    avgDeliveryTime: 'Durchschn. Lieferzeit',
+                    returnedDeposit: 'Zurückgegebenes Pfand'
                 },
                 en: {
                     // Navigation & Menu
@@ -24926,7 +25314,17 @@ class DispatchDashboard {
                     // Login page
                     loginError: 'ERROR: Username or password is incorrect. Please try again.',
                     loginPlaceholder: 'Email or Username',
-                    forgotPassword: 'Forgot Password?'
+                    forgotPassword: 'Forgot Password?',
+
+                    // Performance Statistics
+                    thisWeek: 'THIS WEEK',
+                    thisMonth: 'THIS MONTH',
+                    development: 'Development',
+                    performanceOverview: 'Performance Overview',
+                    totalDeliveries: 'Total Deliveries',
+                    successRate: 'Success Rate',
+                    avgDeliveryTime: 'Avg. Delivery Time',
+                    returnedDeposit: 'Returned Deposit'
                 },
                 es: {
                     // Navigation & Menu
@@ -25083,7 +25481,17 @@ class DispatchDashboard {
                     // Login page
                     loginError: 'ERROR: El nombre de usuario o la contraseña son incorrectos. Por favor, inténtalo de nuevo.',
                     loginPlaceholder: 'Correo o Nombre de Usuario',
-                    forgotPassword: '¿Olvidaste tu contraseña?'
+                    forgotPassword: '¿Olvidaste tu contraseña?',
+
+                    // Performance Statistics
+                    thisWeek: 'ESTA SEMANA',
+                    thisMonth: 'ESTE MES',
+                    development: 'Desarrollo',
+                    performanceOverview: 'Resumen de Rendimiento',
+                    totalDeliveries: 'Entregas Totales',
+                    successRate: 'Tasa de Éxito',
+                    avgDeliveryTime: 'Tiempo Promedio de Entrega',
+                    returnedDeposit: 'Depósito Devuelto'
                 }
             };
 
@@ -26739,7 +27147,7 @@ class DispatchDashboard {
                             </button>
                             ` : ''}
 
-                            <button class="action-button payment" onclick="openSumUpPayment(${order.order_id}, '${formatPrice(order.total)}')">
+                            <button class="action-button payment" onclick="openSumUpPayment(${order.order_id}, '${formatPrice(order.net_payment || order.total)}')">
                                 <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
                                     <path d="M20 4H4c-1.11 0-1.99.89-1.99 2L2 18c0 1.11.89 2 2 2h16c1.11 0 2-.89 2-2V6c0-1.11-.89-2-2-2zm0 14H4v-6h16v6zm0-10H4V6h16v2z"/>
                                 </svg>
@@ -29267,7 +29675,7 @@ class DispatchDashboard {
 
                             // Build variation display with visual separation
                             let variationDisplay = '';
-                            if (parsedSize || parsedFlavor || item.package_quantity) {
+                            if (parsedSize || parsedFlavor || item.package_quantity || item.pfandtyp) {
                                 variationDisplay = '<div style="display: flex; gap: 10px; margin-top: 6px; flex-wrap: wrap;">';
 
                                 // Size/Volume badge (prominent display)
@@ -29323,6 +29731,25 @@ class DispatchDashboard {
                                             gap: 4px;
                                         ">
                                             <span style="font-size: 16px;">📦</span> ${item.package_quantity}
+                                        </span>
+                                    `;
+                                }
+
+                                // Pfandtyp badge (deposit type - e.g. Mehrweg)
+                                if (item.pfandtyp) {
+                                    variationDisplay += `
+                                        <span style="
+                                            background: #8B5CF6;
+                                            color: white;
+                                            padding: 4px 10px;
+                                            border-radius: 6px;
+                                            font-size: 14px;
+                                            font-weight: 600;
+                                            display: inline-flex;
+                                            align-items: center;
+                                            gap: 4px;
+                                        ">
+                                            <span style="font-size: 16px;">♻️</span> ${item.pfandtyp}
                                         </span>
                                     `;
                                 }
@@ -30683,9 +31110,10 @@ class DispatchDashboard {
             }
 
             function openSumUpPayment(orderId, amount) {
-                // Remove € symbol and convert to cents for SumUp
-                const numericAmount = parseFloat(amount.replace('€', '').trim());
-                const amountInCents = Math.round(numericAmount * 100);
+                // Remove € symbol and format as decimal for SumUp (uses decimal, NOT cents!)
+                const numericAmount = parseFloat(amount.replace('€', '').replace(',', '.').trim());
+                // Format with 2 decimal places (e.g., 81.82)
+                const formattedAmount = numericAmount.toFixed(2);
 
                 // Get current user's SumUp affiliate key from user meta
                 const userId = '<?php echo get_current_user_id(); ?>';
@@ -30704,13 +31132,32 @@ class DispatchDashboard {
                 .then(response => response.json())
                 .then(data => {
                     if (data.success && data.data.affiliate_key) {
-                        // Build SumUp URL
-                        const callbackSuccess = encodeURIComponent(window.location.href + '?sumup_success=1&order_id=' + orderId);
-                        const callbackFail = encodeURIComponent(window.location.href + '?sumup_fail=1&order_id=' + orderId);
+                        // Detect platform: iOS vs Android
+                        const isAndroid = /android/i.test(navigator.userAgent);
+                        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
 
-                        const sumupUrl = `sumupmerchant://pay/1.0?affiliate-key=${data.data.affiliate_key}&app-id=de.absa.driver&total=${amountInCents}&currency=EUR&title=Bestellung%20${orderId}&callbacksuccess=${callbackSuccess}&callbackfail=${callbackFail}&foreign-tx-id=${orderId}`;
+                        let sumupUrl;
 
-                        console.log('Opening SumUp with URL:', sumupUrl);
+                        if (isAndroid) {
+                            // Android URL scheme format
+                            // See: https://github.com/sumup/sumup-android-api
+                            // Android uses 'total' (not 'amount'), 'app-id', and single 'callback'
+                            const callback = encodeURIComponent(window.location.href + '?sumup_result=1&order_id=' + orderId);
+
+                            sumupUrl = `sumupmerchant://pay/1.0?affiliate-key=${data.data.affiliate_key}&app-id=com.sumup.merchant&total=${formattedAmount}&currency=EUR&title=Bestellung%20${orderId}&callback=${callback}&foreign-tx-id=${orderId}&skip-screen-success=true`;
+
+                            console.log('Opening SumUp (Android) with URL:', sumupUrl);
+                        } else {
+                            // iOS URL scheme format
+                            // See: https://github.com/sumup/sumup-ios-url-scheme
+                            const callbackSuccess = encodeURIComponent(window.location.href + '?sumup_success=1&order_id=' + orderId);
+                            const callbackFail = encodeURIComponent(window.location.href + '?sumup_fail=1&order_id=' + orderId);
+
+                            sumupUrl = `sumupmerchant://pay/1.0?affiliate-key=${data.data.affiliate_key}&amount=${formattedAmount}&currency=EUR&title=Bestellung%20${orderId}&callbacksuccess=${callbackSuccess}&callbackfail=${callbackFail}&foreign-tx-id=${orderId}&skip-screen-success=true`;
+
+                            console.log('Opening SumUp (iOS) with URL:', sumupUrl);
+                        }
+
                         window.location.href = sumupUrl;
                     } else {
                         alert('❌ SumUp Zugangsdaten nicht konfiguriert. Bitte kontaktieren Sie den Administrator.');
@@ -30722,9 +31169,11 @@ class DispatchDashboard {
                 });
             }
 
-            // Handle SumUp callback
+            // Handle SumUp callback (iOS and Android)
             window.addEventListener('load', function() {
                 const urlParams = new URLSearchParams(window.location.search);
+
+                // iOS success callback
                 if (urlParams.has('sumup_success')) {
                     const orderId = urlParams.get('order_id');
                     alert('✅ Zahlung erfolgreich!');
@@ -30745,10 +31194,45 @@ class DispatchDashboard {
                         // Remove URL parameters and reload
                         window.location.href = window.location.pathname;
                     });
-                } else if (urlParams.has('sumup_fail')) {
+                }
+                // iOS fail callback
+                else if (urlParams.has('sumup_fail')) {
                     alert('❌ Zahlung fehlgeschlagen oder abgebrochen');
                     // Remove URL parameters
                     window.location.href = window.location.pathname;
+                }
+                // Android callback (single callback with smp-status parameter)
+                else if (urlParams.has('sumup_result')) {
+                    const orderId = urlParams.get('order_id');
+                    const smpStatus = urlParams.get('smp-status');
+                    const smpMessage = urlParams.get('smp-message') || '';
+
+                    console.log('Android SumUp callback:', smpStatus, smpMessage);
+
+                    if (smpStatus === 'success') {
+                        alert('✅ Zahlung erfolgreich!');
+
+                        // Mark payment as received
+                        fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/x-www-form-urlencoded',
+                            },
+                            body: new URLSearchParams({
+                                action: 'mark_sumup_payment',
+                                order_id: orderId,
+                                status: 'paid'
+                            })
+                        })
+                        .then(() => {
+                            // Remove URL parameters and reload
+                            window.location.href = window.location.pathname;
+                        });
+                    } else {
+                        alert('❌ Zahlung fehlgeschlagen: ' + smpMessage);
+                        // Remove URL parameters
+                        window.location.href = window.location.pathname;
+                    }
                 }
             });
 
@@ -35047,23 +35531,16 @@ ${username}`);
                 cleanPhone = cleanPhone.replace(/[\s\-\(\)\.]/g, ''); // Remove spaces, dashes, brackets, dots
                 cleanPhone = cleanPhone.replace(/[^\d\+]/g, ''); // Keep only digits and +
 
-                // Add German country code if missing
+                // Use phone number as-is, without adding country code
                 if (cleanPhone && cleanPhone.length >= 6) {
                     // Ensure + is at the beginning if present
                     if (cleanPhone.includes('+') && !cleanPhone.startsWith('+')) {
                         cleanPhone = '+' + cleanPhone.replace(/\+/g, '');
                     }
 
-                    // If no country code, add +49 (Germany) and remove leading 0
-                    if (!cleanPhone.startsWith('+')) {
-                        if (cleanPhone.startsWith('0')) {
-                            // German number with leading 0: remove 0 and add +49
-                            cleanPhone = '+49' + cleanPhone.substring(1);
-                        } else {
-                            // Number without + or 0: add +49
-                            cleanPhone = '+49' + cleanPhone;
-                        }
-                    }
+                    // Use the number exactly as stored - NO automatic country code addition
+                    // If customer has international number with +34, +33, etc., it will be used
+                    // If customer has local number without +, it will be used as-is
 
                     // Show contact modal instead of direct call
                     showContactModal(cleanPhone);
@@ -35822,19 +36299,19 @@ ${username}`);
             
             function showLeistung() {
                 try {
-                    
+
                     // Check if driver is online and ensure correct menu is displayed
                     const isOnline = localStorage.getItem('driver_online_status') === 'true';
                     if (isOnline) {
                         // Make sure we have the online menu
                         updateHamburgerMenuForOnlineStatus();
                     }
-                    
+
                     const headerTitle = document.querySelector('.header-title');
                     if (headerTitle) {
                         headerTitle.textContent = 'Leistung';
                     }
-                    
+
                     mainContent = document.querySelector('.main-content');
                     if (mainContent) {
                         // Clear content immediately to prevent flicker
@@ -35844,26 +36321,114 @@ ${username}`);
                                 <div class="loading-text">Lade Statistiken...</div>
                             </div>
                         `;
-                        
-                        // After a short delay, show the actual content
-                        setTimeout(() => {
-                            if (document.querySelector('.loading-screen-stats')) {
+
+                        // Load statistics from backend
+                        fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/x-www-form-urlencoded',
+                            },
+                            body: 'action=get_driver_order_stats&nonce=' + dispatch_ajax.nonce
+                        })
+                        .then(response => response.json())
+                        .then(result => {
+                            if (result.success) {
+                                const stats = result.data;
+
+                                // Calculate proportional bar widths
+                                const maxDeliveries = Math.max(stats.today, stats.week, stats.month, 1);
+                                const todayPercent = (stats.today / maxDeliveries) * 100;
+                                const weekPercent = (stats.week / maxDeliveries) * 100;
+                                const monthPercent = (stats.month / maxDeliveries) * 100;
+
+                                // Calculate success rate (assuming all completed orders are successful)
+                                const successRate = stats.total > 0 ? 100 : 0;
+
                                 mainContent.innerHTML = `
-                                    <div class="empty-state-screen">
-                                        <div class="empty-state-icon">
-                                            <svg viewBox="0 0 24 24" style="fill: #8b5cf6;">
-                                                <path d="M2,2V4H4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V4H22V2H2M6,4H18V20H6V4M8,6V18H10V6H8M12,6V18H14V6H12M16,6V18H18V6H16Z"/>
-                                            </svg>
+                                    <div class="stats-container-grid">
+
+                                        <!-- 4 Icon Cards in 2x2 Grid -->
+                                        <div class="stats-grid">
+                                            <div class="stat-card stat-card-blue">
+                                                <div class="stat-icon">📅</div>
+                                                <div class="stat-label">${t('today')}</div>
+                                                <div class="stat-value">${stats.today}</div>
+                                            </div>
+                                            <div class="stat-card stat-card-pink">
+                                                <div class="stat-icon">🔄</div>
+                                                <div class="stat-label">${t('thisWeek')}</div>
+                                                <div class="stat-value">${stats.week}</div>
+                                            </div>
+                                            <div class="stat-card stat-card-cyan">
+                                                <div class="stat-icon">🎂</div>
+                                                <div class="stat-label">${t('thisMonth')}</div>
+                                                <div class="stat-value">${stats.month}</div>
+                                            </div>
+                                            <div class="stat-card stat-card-orange">
+                                                <div class="stat-icon">⭐</div>
+                                                <div class="stat-label">${t('rating')}</div>
+                                                <div class="stat-value">${stats.rating_average > 0 ? stats.rating_average.toFixed(1) : '0'}</div>
+                                            </div>
                                         </div>
-                                        <div class="empty-state-message">Leistungsstatistiken</div>
-                                        <div style="margin-top: 20px; color: #9CA3AF; font-size: 14px;">
-                                            📊 Tagesstatistiken<br>
-                                            ⭐ Bewertungen<br>
-                                            📈 Leistungsübersicht<br>
-                                            Feature kommt bald!
+
+                                        <!-- Entwicklung Chart -->
+                                        <div class="chart-section">
+                                            <div class="chart-header">
+                                                <span class="chart-icon">📊</span>
+                                                <span class="chart-title">${t('development')}</span>
+                                            </div>
+                                            <div class="chart-bars">
+                                                <div class="bar-row">
+                                                    <span class="bar-label">${t('today')}</span>
+                                                    <div class="bar-container">
+                                                        <div class="bar bar-blue" style="width: ${todayPercent}%"></div>
+                                                    </div>
+                                                    <span class="bar-value">${stats.today}</span>
+                                                </div>
+                                                <div class="bar-row">
+                                                    <span class="bar-label">${t('thisWeek')}</span>
+                                                    <div class="bar-container">
+                                                        <div class="bar bar-pink" style="width: ${weekPercent}%"></div>
+                                                    </div>
+                                                    <span class="bar-value">${stats.week}</span>
+                                                </div>
+                                                <div class="bar-row">
+                                                    <span class="bar-label">${t('thisMonth')}</span>
+                                                    <div class="bar-container">
+                                                        <div class="bar bar-cyan" style="width: ${monthPercent}%"></div>
+                                                    </div>
+                                                    <span class="bar-value">${stats.month}</span>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <!-- Leistungsübersicht List -->
+                                        <div class="overview-section">
+                                            <div class="overview-header">
+                                                <span class="overview-icon">📈</span>
+                                                <span class="overview-title">${t('performanceOverview')}</span>
+                                            </div>
+                                            <div class="overview-list">
+                                                <div class="overview-item">
+                                                    <span class="overview-label">${t('totalDeliveries')}:</span>
+                                                    <span class="overview-value">${stats.total}</span>
+                                                </div>
+                                                <div class="overview-item">
+                                                    <span class="overview-label">${t('successRate')}:</span>
+                                                    <span class="overview-value">${successRate}%</span>
+                                                </div>
+                                                <div class="overview-item">
+                                                    <span class="overview-label">${t('avgDeliveryTime')}:</span>
+                                                    <span class="overview-value">${stats.avg_delivery_time > 0 ? stats.avg_delivery_time + ' min' : 'N/A'}</span>
+                                                </div>
+                                                <div class="overview-item">
+                                                    <span class="overview-label">${t('returnedDeposit')}:</span>
+                                                    <span class="overview-value">€${stats.total_pfand.toFixed(2).replace('.', ',')}</span>
+                                                </div>
+                                            </div>
                                         </div>
                                     </div>
-                                    
+
                                     <!-- Bottom Navigation -->
                                     <div class="bottom-navigation">
                                         <a href="#bestellungen" class="nav-item" onclick="showBestellungen()">
@@ -35891,18 +36456,49 @@ ${username}`);
                             </div>
                                             <div class="label">${t('waiting')}</div>
                                         </a>
-                                        <a href="#packliste" class="nav-item active" onclick="showPackliste()">
+                                        <a href="#leistung" class="nav-item active" onclick="showLeistung()">
                                             <div class="icon">
                                 <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
-                                    <path d="M19 3h-4.18C14.4 1.84 13.3 1 12 1c-1.3 0-2.4.84-2.82 2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 0c.55 0 1 .45 1 1s-.45 1-1 1-1-.45-1-1 .45-1 1-1zm2 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z"/>
+                                    <path d="M2,2V4H4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V4H22V2H2M6,4H18V20H6V4M8,6V18H10V6H8M12,6V18H14V6H12M16,6V18H18V6H16Z"/>
                                 </svg>
                             </div>
-                                            <div class="label">${t('packlist')}</div>
+                                            <div class="label">${t('performance')}</div>
                                         </a>
                                     </div>
                                 `;
+                            } else {
+                                // Error from backend
+                                mainContent.innerHTML = `
+                                    <div class="empty-state-screen">
+                                        <div class="empty-state-icon">
+                                            <svg viewBox="0 0 24 24" style="fill: #ef4444;">
+                                                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/>
+                                            </svg>
+                                        </div>
+                                        <div class="empty-state-message">Fehler beim Laden</div>
+                                        <div style="margin-top: 15px; color: #9CA3AF; font-size: 14px;">
+                                            ${result.data || 'Statistiken konnten nicht geladen werden'}
+                                        </div>
+                                    </div>
+                                `;
                             }
-                        }, 300);
+                        })
+                        .catch(error => {
+                            console.error('Error loading stats:', error);
+                            mainContent.innerHTML = `
+                                <div class="empty-state-screen">
+                                    <div class="empty-state-icon">
+                                        <svg viewBox="0 0 24 24" style="fill: #ef4444;">
+                                            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/>
+                                        </svg>
+                                    </div>
+                                    <div class="empty-state-message">Verbindungsfehler</div>
+                                    <div style="margin-top: 15px; color: #9CA3AF; font-size: 14px;">
+                                        Bitte versuche es später erneut
+                                    </div>
+                                </div>
+                            `;
+                        });
                     }
                 } catch (error) {
                     console.error('Error in showLeistung:', error);
@@ -40040,51 +40636,74 @@ Ihr Lieferteam',
         $assigned_at = $order->get_meta('_driver_assigned_at');
         $order_ready = $order->get_meta('_order_ready') === 'yes';
 
-        // Get delivery address coordinates (3-tier priority)
-        // Priority 1: LPAC coordinates (most accurate)
-        $customer_lat = $order->get_meta('lpac_latitude');
-        $customer_lng = $order->get_meta('lpac_longitude');
+        // Get delivery address coordinates (5-tier priority)
+        // PRIORITY 1 (HIGHEST): Plus Code from USER PROFILE (Stammkunde)
+        $customer_lat = null;
+        $customer_lng = null;
+        $profile_customer_id = $order->get_customer_id();
 
-        // Priority 2: Shipping coordinates (from geocoding/manual entry)
+        if ($profile_customer_id > 0) {
+            $user_plus_code = get_user_meta($profile_customer_id, 'plus_code', true);
+            if (!empty($user_plus_code)) {
+                $coords = $this->plusCodeToCoordinates($user_plus_code);
+                if ($coords) {
+                    $customer_lat = $coords['lat'];
+                    $customer_lng = $coords['lng'];
+                }
+            }
+        } else {
+            $guest_email = $order->get_billing_email();
+            if (!empty($guest_email)) {
+                $guest_user = get_user_by('email', $guest_email);
+                if ($guest_user) {
+                    $user_plus_code = get_user_meta($guest_user->ID, 'plus_code', true);
+                    if (!empty($user_plus_code)) {
+                        $coords = $this->plusCodeToCoordinates($user_plus_code);
+                        if ($coords) {
+                            $customer_lat = $coords['lat'];
+                            $customer_lng = $coords['lng'];
+                        }
+                    }
+                }
+            }
+        }
+
+        // Priority 2: LPAC coordinates
+        if (empty($customer_lat) || empty($customer_lng)) {
+            $customer_lat = $order->get_meta('lpac_latitude');
+            $customer_lng = $order->get_meta('lpac_longitude');
+        }
+
+        // Priority 3: Shipping coordinates
         if (empty($customer_lat) || empty($customer_lng)) {
             $customer_lat = $order->get_meta('_shipping_latitude');
             $customer_lng = $order->get_meta('_shipping_longitude');
         }
 
-        // Priority 3: Billing coordinates (fallback)
+        // Priority 4: Billing coordinates
         if (empty($customer_lat) || empty($customer_lng)) {
             $customer_lat = $order->get_meta('billing_latitude');
             $customer_lng = $order->get_meta('billing_longitude');
         }
 
-        // Priority 4: Plus Code from meta fields or address
+        // Priority 5: Plus Code from order meta or address
         if (empty($customer_lat) || empty($customer_lng)) {
-            // Try Plus Code from meta fields first
             $plus_code = $order->get_meta('plus_code') ?: $order->get_meta('_billing_plus_code') ?: $order->get_meta('_shipping_plus_code');
 
-            // If no Plus Code in meta, try to extract from address
             if (empty($plus_code)) {
                 $address_1 = $order->get_shipping_address_1();
                 if (preg_match('/([23456789CFGHJMPQRVWX]{4,8}\+[23456789CFGHJMPQRVWX]{2,3})/i', $address_1, $matches)) {
                     $plus_code = strtoupper($matches[1]);
-                    // Save Plus Code to meta for future use
                     $order->update_meta_data('_shipping_plus_code', $plus_code);
                     $order->save();
                 }
             }
 
-            // Decode Plus Code to coordinates
             if (!empty($plus_code)) {
                 $coords = $this->plusCodeToCoordinates($plus_code);
                 if ($coords) {
                     $customer_lat = $coords['lat'];
                     $customer_lng = $coords['lng'];
-                    // Save coordinates for future use
-                    $order->update_meta_data('lpac_latitude', $customer_lat);
-                    $order->update_meta_data('lpac_longitude', $customer_lng);
-                    $order->update_meta_data('_shipping_latitude', $customer_lat);
-                    $order->update_meta_data('_shipping_longitude', $customer_lng);
-                    $order->save();
                 }
             }
         }
@@ -40708,8 +41327,10 @@ Ihr Lieferteam',
                             // Update ETA display
                             const etaDisplay = document.getElementById('eta-display');
 
-                            // Check if driver has arrived (< 1 minute)
-                            if (totalETA <= 1) {
+
+                            // Check if driver has arrived (< 1 minute AND within 150 meters)
+                            const directDistance = calculateDistance(currentDriverLat, currentDriverLng, customerLat, customerLng);
+                            if (totalETA <= 1 && directDistance < 0.15) { // 0.15 km = 150 meters
                                 etaDisplay.textContent = 'Angekommen';
                                 etaDisplay.style.color = '#10b981';
                                 etaDisplay.style.fontWeight = '600';
