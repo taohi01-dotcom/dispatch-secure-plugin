@@ -1,21 +1,13 @@
 <?php
 /**
- * Plugin Name: Dispatch SECURE v2.9.75
+ * Plugin Name: Dispatch SECURE v2.9.74
  * Plugin URI: https://your-domain.de
  * Description: Enhanced routing map display & driver management improvements
- * Version: 2.9.75
+ * Version: 2.9.74
  * Author: Ihr Name
  * License: GPL v2 or later
  * Requires PHP: 8.3
  * Requires at least: 6.0
- *
- * SUMUP ANDROID FIX & PACKLISTE PFANDTYP v2.9.75 (2025-12-04):
- * - FIXED: SumUp URL scheme now detects iOS vs Android platform
- * - FIXED: Android uses correct parameters: app-id, total (not amount), single callback
- * - FIXED: Android callback handler processes smp-status parameter correctly
- * - ADDED: Pfandtyp (deposit type) attribute now displayed in Packliste
- * - ADDED: Purple badge with ♻️ icon shows "Mehrweg" or other deposit types
- * - IMPROVED: Better compatibility with SumUp Tap to Pay on Android devices
  *
  * METADATA SYNC FIX v2.9.74 (2025-11-19):
  * - FIXED: ajaxUpdateOrderStatus now cleans up metadata when "geladen" status is removed
@@ -14842,40 +14834,6 @@ class DispatchDashboard {
                     }
                 }
 
-                // Get Pfandtyp (deposit type) from product attribute
-                $pfandtyp = '';
-                if ($product) {
-                    // First try to get from the product directly (for simple products)
-                    $parent_product = $product->is_type('variation') ? wc_get_product($product->get_parent_id()) : $product;
-
-                    if ($parent_product) {
-                        // Try to get Pfandtyp attribute
-                        $pfandtyp_attr = $parent_product->get_attribute('pa_pfandtyp');
-                        if (empty($pfandtyp_attr)) {
-                            $pfandtyp_attr = $parent_product->get_attribute('pfandtyp');
-                        }
-                        if (!empty($pfandtyp_attr)) {
-                            $pfandtyp = $pfandtyp_attr;
-                        }
-                    }
-
-                    // Also check variation attributes if it's a variation
-                    if (empty($pfandtyp) && $product->is_type('variation')) {
-                        $variation_attributes = $product->get_variation_attributes();
-                        if (isset($variation_attributes['attribute_pa_pfandtyp'])) {
-                            $pfandtyp_slug = $variation_attributes['attribute_pa_pfandtyp'];
-                            if (taxonomy_exists('pa_pfandtyp')) {
-                                $term = get_term_by('slug', $pfandtyp_slug, 'pa_pfandtyp');
-                                if ($term) {
-                                    $pfandtyp = $term->name;
-                                }
-                            } else {
-                                $pfandtyp = $pfandtyp_slug;
-                            }
-                        }
-                    }
-                }
-
                 $items[] = [
                     'id' => $item_id,
                     'name' => $item_name,
@@ -14883,7 +14841,6 @@ class DispatchDashboard {
                     'size' => $size_info,
                     'flavor' => $flavor_info,
                     'package_quantity' => $package_quantity,
-                    'pfandtyp' => $pfandtyp,
                     'sku' => $product ? $product->get_sku() : '',
                     'quantity' => $item->get_quantity(),
                     'total' => number_format($item->get_total(), 2, ',', '.') . ' €',
@@ -29675,7 +29632,7 @@ class DispatchDashboard {
 
                             // Build variation display with visual separation
                             let variationDisplay = '';
-                            if (parsedSize || parsedFlavor || item.package_quantity || item.pfandtyp) {
+                            if (parsedSize || parsedFlavor || item.package_quantity) {
                                 variationDisplay = '<div style="display: flex; gap: 10px; margin-top: 6px; flex-wrap: wrap;">';
 
                                 // Size/Volume badge (prominent display)
@@ -29731,25 +29688,6 @@ class DispatchDashboard {
                                             gap: 4px;
                                         ">
                                             <span style="font-size: 16px;">📦</span> ${item.package_quantity}
-                                        </span>
-                                    `;
-                                }
-
-                                // Pfandtyp badge (deposit type - e.g. Mehrweg)
-                                if (item.pfandtyp) {
-                                    variationDisplay += `
-                                        <span style="
-                                            background: #8B5CF6;
-                                            color: white;
-                                            padding: 4px 10px;
-                                            border-radius: 6px;
-                                            font-size: 14px;
-                                            font-weight: 600;
-                                            display: inline-flex;
-                                            align-items: center;
-                                            gap: 4px;
-                                        ">
-                                            <span style="font-size: 16px;">♻️</span> ${item.pfandtyp}
                                         </span>
                                     `;
                                 }
@@ -31132,32 +31070,14 @@ class DispatchDashboard {
                 .then(response => response.json())
                 .then(data => {
                     if (data.success && data.data.affiliate_key) {
-                        // Detect platform: iOS vs Android
-                        const isAndroid = /android/i.test(navigator.userAgent);
-                        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+                        // Build SumUp URL - uses 'amount' parameter with decimal format
+                        // See: https://github.com/sumup/sumup-ios-url-scheme
+                        const callbackSuccess = encodeURIComponent(window.location.href + '?sumup_success=1&order_id=' + orderId);
+                        const callbackFail = encodeURIComponent(window.location.href + '?sumup_fail=1&order_id=' + orderId);
 
-                        let sumupUrl;
+                        const sumupUrl = `sumupmerchant://pay/1.0?affiliate-key=${data.data.affiliate_key}&amount=${formattedAmount}&currency=EUR&title=Bestellung%20${orderId}&callbacksuccess=${callbackSuccess}&callbackfail=${callbackFail}&foreign-tx-id=${orderId}&skip-screen-success=true`;
 
-                        if (isAndroid) {
-                            // Android URL scheme format
-                            // See: https://github.com/sumup/sumup-android-api
-                            // Android uses 'total' (not 'amount'), 'app-id', and single 'callback'
-                            const callback = encodeURIComponent(window.location.href + '?sumup_result=1&order_id=' + orderId);
-
-                            sumupUrl = `sumupmerchant://pay/1.0?affiliate-key=${data.data.affiliate_key}&app-id=com.sumup.merchant&total=${formattedAmount}&currency=EUR&title=Bestellung%20${orderId}&callback=${callback}&foreign-tx-id=${orderId}&skip-screen-success=true`;
-
-                            console.log('Opening SumUp (Android) with URL:', sumupUrl);
-                        } else {
-                            // iOS URL scheme format
-                            // See: https://github.com/sumup/sumup-ios-url-scheme
-                            const callbackSuccess = encodeURIComponent(window.location.href + '?sumup_success=1&order_id=' + orderId);
-                            const callbackFail = encodeURIComponent(window.location.href + '?sumup_fail=1&order_id=' + orderId);
-
-                            sumupUrl = `sumupmerchant://pay/1.0?affiliate-key=${data.data.affiliate_key}&amount=${formattedAmount}&currency=EUR&title=Bestellung%20${orderId}&callbacksuccess=${callbackSuccess}&callbackfail=${callbackFail}&foreign-tx-id=${orderId}&skip-screen-success=true`;
-
-                            console.log('Opening SumUp (iOS) with URL:', sumupUrl);
-                        }
-
+                        console.log('Opening SumUp with URL:', sumupUrl);
                         window.location.href = sumupUrl;
                     } else {
                         alert('❌ SumUp Zugangsdaten nicht konfiguriert. Bitte kontaktieren Sie den Administrator.');
@@ -31169,11 +31089,9 @@ class DispatchDashboard {
                 });
             }
 
-            // Handle SumUp callback (iOS and Android)
+            // Handle SumUp callback
             window.addEventListener('load', function() {
                 const urlParams = new URLSearchParams(window.location.search);
-
-                // iOS success callback
                 if (urlParams.has('sumup_success')) {
                     const orderId = urlParams.get('order_id');
                     alert('✅ Zahlung erfolgreich!');
@@ -31194,45 +31112,10 @@ class DispatchDashboard {
                         // Remove URL parameters and reload
                         window.location.href = window.location.pathname;
                     });
-                }
-                // iOS fail callback
-                else if (urlParams.has('sumup_fail')) {
+                } else if (urlParams.has('sumup_fail')) {
                     alert('❌ Zahlung fehlgeschlagen oder abgebrochen');
                     // Remove URL parameters
                     window.location.href = window.location.pathname;
-                }
-                // Android callback (single callback with smp-status parameter)
-                else if (urlParams.has('sumup_result')) {
-                    const orderId = urlParams.get('order_id');
-                    const smpStatus = urlParams.get('smp-status');
-                    const smpMessage = urlParams.get('smp-message') || '';
-
-                    console.log('Android SumUp callback:', smpStatus, smpMessage);
-
-                    if (smpStatus === 'success') {
-                        alert('✅ Zahlung erfolgreich!');
-
-                        // Mark payment as received
-                        fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/x-www-form-urlencoded',
-                            },
-                            body: new URLSearchParams({
-                                action: 'mark_sumup_payment',
-                                order_id: orderId,
-                                status: 'paid'
-                            })
-                        })
-                        .then(() => {
-                            // Remove URL parameters and reload
-                            window.location.href = window.location.pathname;
-                        });
-                    } else {
-                        alert('❌ Zahlung fehlgeschlagen: ' + smpMessage);
-                        // Remove URL parameters
-                        window.location.href = window.location.pathname;
-                    }
                 }
             });
 
@@ -39812,7 +39695,13 @@ Ihr Lieferteam',
     }
 
     /**
-     * Ensure Plus Code exists for order
+     * Ensure Plus Code exists for order AND calculate distance/ETA
+     *
+     * Logic:
+     * 1. Check if Plus Code exists in user profile
+     * 2. ALWAYS calculate distance/ETA when coordinates are available
+     * 3. If no Plus Code in profile: check shipping address, then billing address
+     * 4. If address deviates >100m from profile Plus Code: warn admin
      */
     public function ensurePlusCodeForOrder($order_id): void {
         $order = wc_get_order($order_id);
@@ -39821,26 +39710,186 @@ Ihr Lieferteam',
             return;
         }
 
-        // Check if we already have a Plus Code
-        $plus_code = $this->getOrderPlusCode($order);
+        $user_id = $order->get_customer_id();
+        $coordinates = null;
+        $plus_code = null;
+        $plus_code_source = null;
 
-        if (!empty($plus_code)) {
-            return;
-        }
+        // ========================================
+        // STEP 1: Check Plus Code in user profile
+        // ========================================
+        if ($user_id) {
+            $user_plus_code = get_user_meta($user_id, 'billing_pluscode', true);
+            if (empty($user_plus_code)) {
+                $user_plus_code = get_user_meta($user_id, 'plus_code', true);
+            }
 
-        // Try to get from coordinates
-        $latitude = $order->get_meta('lpac_latitude');
-        $longitude = $order->get_meta('lpac_longitude');
+            if (!empty($user_plus_code) && $user_plus_code !== 'NONE') {
+                $plus_code = $user_plus_code;
+                $plus_code_source = 'user_profile';
 
-        if ($latitude && $longitude) {
-            $generated_plus_code = $this->generatePlusCodeFromCoordinates($latitude, $longitude);
+                // Decode Plus Code to coordinates
+                $decoded = $this->decodePlusCode($user_plus_code);
+                if ($decoded) {
+                    $coordinates = [
+                        'lat' => $decoded['lat'],
+                        'lng' => $decoded['lng']
+                    ];
+                }
 
-            if ($generated_plus_code) {
-                $order->update_meta_data('_billing_plus_code', $generated_plus_code);
-                $order->update_meta_data('plus_code_source', 'generated_from_coords');
-                $order->save();
+                error_log("ensurePlusCodeForOrder: Order #{$order_id} - Using Plus Code from user profile: {$plus_code}");
             }
         }
+
+        // ========================================
+        // STEP 2: Collect coordinates from order (for distance calc and deviation check)
+        // ========================================
+        $order_lat = $order->get_meta('billing_latitude') ?: $order->get_meta('lpac_latitude');
+        $order_lng = $order->get_meta('billing_longitude') ?: $order->get_meta('lpac_longitude');
+
+        // Fallback: delivery_coordinates JSON
+        if (empty($order_lat) || empty($order_lng)) {
+            $coords_json = $order->get_meta('delivery_coordinates');
+            if (is_array($coords_json)) {
+                $order_lat = $coords_json['lat'] ?? '';
+                $order_lng = $coords_json['lng'] ?? '';
+            }
+        }
+
+        $order_coordinates = null;
+        if (!empty($order_lat) && !empty($order_lng)) {
+            $order_coordinates = ['lat' => floatval($order_lat), 'lng' => floatval($order_lng)];
+        }
+
+        // ========================================
+        // STEP 3: If no Plus Code from profile, try to get/generate from order
+        // ========================================
+        if (empty($plus_code)) {
+            // Check order meta for existing Plus Code
+            $order_plus_code = $order->get_meta('_billing_plus_code') ?: $order->get_meta('billing_pluscode');
+
+            if (!empty($order_plus_code) && $order_plus_code !== 'NONE') {
+                $plus_code = $order_plus_code;
+                $plus_code_source = 'order_meta';
+            } elseif ($order_coordinates) {
+                // Generate Plus Code from order coordinates
+                $generated = $this->generatePlusCodeFromCoordinates($order_coordinates['lat'], $order_coordinates['lng']);
+                if ($generated) {
+                    $plus_code = $generated;
+                    $plus_code_source = 'generated_from_order_coords';
+                }
+            }
+
+            // Use order coordinates if we don't have profile coordinates
+            if (!$coordinates && $order_coordinates) {
+                $coordinates = $order_coordinates;
+            }
+        }
+
+        // ========================================
+        // STEP 4: ALWAYS calculate distance/ETA if coordinates available
+        // ========================================
+        $existing_distance = $order->get_meta('lpac_customer_distance');
+
+        if (empty($existing_distance) && $coordinates) {
+            // Get depot coordinates
+            $settings = $this->getSettings();
+            $depot_lat = $settings['depot_latitude'] ?? get_option('dispatch_depot_latitude', '39.4887003');
+            $depot_lng = $settings['depot_longitude'] ?? get_option('dispatch_depot_longitude', '2.8970119');
+
+            if ($depot_lat && $depot_lng) {
+                $route_data = $this->calculateDrivingDistance(
+                    floatval($depot_lat),
+                    floatval($depot_lng),
+                    $coordinates['lat'],
+                    $coordinates['lng'],
+                    $order_id
+                );
+
+                if ($route_data && isset($route_data['distance_km'])) {
+                    $order->update_meta_data('lpac_customer_distance', round($route_data['distance_km'], 2));
+                    $order->update_meta_data('lpac_customer_distance_unit', 'km');
+                    $order->update_meta_data('lpac_customer_distance_duration', $route_data['duration_minutes'] . ' mins');
+                    $order->update_meta_data('_dispatch_distance_calculated', 'yes');
+
+                    error_log("ensurePlusCodeForOrder: Order #{$order_id} - Distance calculated: {$route_data['distance_km']} km, ETA: {$route_data['duration_minutes']} mins");
+                }
+            }
+        }
+
+        // ========================================
+        // STEP 5: Address deviation check (>100m warning)
+        // ========================================
+        if ($user_id && $coordinates && $order_coordinates) {
+            // Only check if we have both profile coordinates and order coordinates
+            $user_plus_code = get_user_meta($user_id, 'billing_pluscode', true) ?: get_user_meta($user_id, 'plus_code', true);
+
+            if (!empty($user_plus_code) && $user_plus_code !== 'NONE') {
+                $profile_coords = $this->decodePlusCode($user_plus_code);
+
+                if ($profile_coords) {
+                    // Calculate deviation in meters using Haversine formula
+                    $deviation_km = $this->calculateHaversineDistance(
+                        $profile_coords['lat'],
+                        $profile_coords['lng'],
+                        $order_coordinates['lat'],
+                        $order_coordinates['lng']
+                    );
+                    $deviation_meters = $deviation_km * 1000;
+
+                    if ($deviation_meters > 100) {
+                        // Address deviation > 100m - warn admin
+                        $order->update_meta_data('_address_deviation_warning', 'yes');
+                        $order->update_meta_data('_address_deviation_meters', round($deviation_meters));
+
+                        $warning_note = sprintf(
+                            '⚠️ ADRESS-ABWEICHUNG: Die Lieferadresse weicht um %d Meter vom hinterlegten Plus Code im Kundenprofil ab. Bitte prüfen!',
+                            round($deviation_meters)
+                        );
+                        $order->add_order_note($warning_note);
+
+                        error_log("ensurePlusCodeForOrder: Order #{$order_id} - ADDRESS DEVIATION WARNING: {$deviation_meters}m from profile Plus Code");
+                    }
+                }
+            }
+        }
+
+        // ========================================
+        // STEP 6: Save Plus Code to order
+        // ========================================
+        if (!empty($plus_code)) {
+            $order->update_meta_data('_billing_plus_code', $plus_code);
+            $order->update_meta_data('plus_code_source', $plus_code_source);
+        }
+
+        // Save all changes
+        $order->save();
+    }
+
+    /**
+     * Calculate distance between two coordinates using Haversine formula
+     *
+     * @param float $lat1 First latitude
+     * @param float $lng1 First longitude
+     * @param float $lat2 Second latitude
+     * @param float $lng2 Second longitude
+     * @return float Distance in kilometers
+     */
+    private function calculateHaversineDistance($lat1, $lng1, $lat2, $lng2): float {
+        $earth_radius = 6371; // km
+
+        $lat1_rad = deg2rad($lat1);
+        $lat2_rad = deg2rad($lat2);
+        $delta_lat = deg2rad($lat2 - $lat1);
+        $delta_lng = deg2rad($lng2 - $lng1);
+
+        $a = sin($delta_lat / 2) * sin($delta_lat / 2) +
+             cos($lat1_rad) * cos($lat2_rad) *
+             sin($delta_lng / 2) * sin($delta_lng / 2);
+
+        $c = 2 * atan2(sqrt($a), sqrt(1 - $a));
+
+        return $earth_radius * $c;
     }
 
     /**
