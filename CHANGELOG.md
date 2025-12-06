@@ -4,6 +4,54 @@ Alle wichtigen Änderungen am Dispatch SECURE Plugin werden hier dokumentiert.
 
 ---
 
+## [2.9.77] - 2025-12-06
+
+### 🐛 KRITISCHER BUGFIX: Fatal Error `decodePlusCode()`
+
+#### ❌ Problem
+- **Fatal Error:** `Call to undefined method DispatchDashboard::decodePlusCode()`
+- **Betroffene Zeilen:** 40029 und 40125 in `dispatch-dashboard.php`
+- **Auswirkung:**
+  - Bestellungen ohne Koordinaten/Distanz/ETA
+  - Endlosschleifen mit Timeout (180-570 Sekunden)
+  - Plus Code aus Kundenprofil konnte nicht decodiert werden
+
+#### 🔍 Ursache
+Die Methode `decodePlusCode()` wurde in `ensurePlusCodeForOrder()` aufgerufen, existierte aber nicht.
+Eine ähnliche Methode `plusCodeToCoordinates()` war bereits vorhanden (Zeile 39825).
+
+#### ✅ Lösung
+Neue Alias-Methode `decodePlusCode()` hinzugefügt (nach Zeile 39862):
+
+```php
+/**
+ * Decode Plus Code to coordinates (alias for plusCodeToCoordinates)
+ *
+ * @param string $plus_code Plus Code string
+ * @return array|null Array with 'lat' and 'lng' keys, or null on failure
+ */
+private function decodePlusCode(string $plus_code): ?array {
+    return $this->plusCodeToCoordinates($plus_code);
+}
+```
+
+#### 📊 Auswirkung
+- ✅ Plus Code aus Kundenprofil wird korrekt decodiert
+- ✅ Koordinaten werden extrahiert
+- ✅ OSRM berechnet echte Fahrstrecke und ETA
+- ✅ `lpac_customer_distance`, `lpac_customer_distance_duration` werden gesetzt
+- ✅ Distanz/ETA wird in WooCommerce Bestellungsübersicht angezeigt
+
+#### 🧪 Getestet mit
+- Bestellung #60444 (Stephan Elders)
+- Plus Code aus Profil: `8FF5944H+8F`
+- Ergebnis: 26,6 km / 30 mins (via OSRM)
+
+#### 📁 Geänderte Dateien
+- `dispatch-dashboard.php` (neue Methode nach Zeile 39862)
+
+---
+
 ## ⚠️ TODO: Test-Dateien löschen
 
 **Nach dem Testen bitte folgende Dateien vom Server entfernen:**

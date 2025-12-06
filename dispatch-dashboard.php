@@ -5644,51 +5644,54 @@ class DispatchDashboard {
         Dispatch_Security::verify_driver_access(true);
 
         $customer_email = sanitize_email($_POST['customer_email'] ?? '');
+        $customer_phone = sanitize_text_field($_POST['customer_phone'] ?? '');
         $exclude_order_id = intval($_POST['exclude_order_id'] ?? 0);
         $include_current = ($_POST['include_current'] ?? 'false') === 'true';
 
-        // If no email provided, try to get it from the order
-        if (empty($customer_email) && $exclude_order_id > 0) {
+        // If no email/phone provided, try to get them from the order
+        $plus_code = '';
+        if ((empty($customer_email) || empty($customer_phone)) && $exclude_order_id > 0) {
             $order = wc_get_order($exclude_order_id);
             if ($order) {
-                $customer_email = $order->get_billing_email();
+                if (empty($customer_email)) {
+                    $customer_email = $order->get_billing_email();
+                }
+                if (empty($customer_phone)) {
+                    $customer_phone = $order->get_billing_phone();
+                }
+                // Get Plus Code from order (try multiple meta keys)
+                $plus_code = $order->get_meta('_billing_plus_code');
+                if (empty($plus_code)) {
+                    $plus_code = $order->get_meta('plus_code');
+                }
+                if (empty($plus_code)) {
+                    $plus_code = $order->get_meta('lpac_plus_code');
+                }
             }
         }
 
-        // Validate email
-        if (empty($customer_email) || !is_email($customer_email)) {
-            error_log('Pfand History - Invalid or empty email: ' . $customer_email);
-            // Return empty history instead of error for driver app
+        // Normalize phone number for comparison (remove spaces, dashes, leading zeros/+)
+        $normalized_phone = $this->normalizePhoneNumber($customer_phone);
+
+        // Validate - we need at least email OR phone OR plus code
+        if ((empty($customer_email) || !is_email($customer_email)) && empty($normalized_phone) && empty($plus_code)) {
+            error_log('Pfand History - No valid email, phone or plus code: ' . $customer_email . ' / ' . $customer_phone);
             wp_send_json_success([
                 'history' => [],
                 'order_total' => 0,
                 'is_demo' => false,
-                'debug' => 'Invalid email: ' . $customer_email
+                'debug' => 'No valid email, phone or plus code'
             ]);
             return;
         }
-        
+
         // Get the configured start date for Pfand system
         $pfand_start_date = get_option('dispatch_pfand_start_date', '');
 
-        // Build query args with date filter if configured
-        $query_args = [
-            'customer' => $customer_email,
-            'limit' => -1,
-            'status' => ['processing', 'completed', 'on-hold'],
-            'orderby' => 'date',
-            'order' => 'DESC',
-            'return' => 'objects'
-        ];
-
-        // Add date filter if configured
-        if (!empty($pfand_start_date)) {
-            $query_args['date_created'] = '>=' . strtotime($pfand_start_date);
-        }
-
-        // Suche nach Bestellungen des Kunden mit Pfand
-        // WICHTIG: Verwende 'customer' statt 'billing_email' - wie im funktionierenden Plugin
-        $orders = wc_get_orders($query_args);
+        // COMBINED SEARCH: Find orders by EMAIL, PHONE or PLUS CODE
+        // This solves the problem where customers order with different email addresses
+        // Plus Code identifies the delivery location (same address = same customer)
+        $orders = $this->findOrdersByEmailPhoneOrPlusCode($customer_email, $normalized_phone, $plus_code, $pfand_start_date);
 
         $pfand_history = [];
         $order_total = 0;
@@ -5738,7 +5741,216 @@ class DispatchDashboard {
             'order_total' => $order_total
         ]);
     }
-    
+
+    /**
+     * Normalize phone number for comparison
+     * Removes spaces, dashes, parentheses, and normalizes country codes
+     */
+    private function normalizePhoneNumber(string $phone): string {
+        if (empty($phone)) {
+            return '';
+        }
+
+        // Remove all non-numeric characters except +
+        $phone = preg_replace('/[^0-9+]/', '', $phone);
+
+        // Remove leading + and replace with 00
+        if (strpos($phone, '+') === 0) {
+            $phone = '00' . substr($phone, 1);
+        }
+
+        // Remove leading 00 for comparison (we'll compare just the core number)
+        if (strpos($phone, '00') === 0) {
+            $phone = substr($phone, 2);
+        }
+
+        // Remove leading 0 for local numbers
+        if (strpos($phone, '0') === 0 && strlen($phone) > 1) {
+            $phone = substr($phone, 1);
+        }
+
+        // Return last 9 digits for comparison (handles different country code formats)
+        if (strlen($phone) > 9) {
+            return substr($phone, -9);
+        }
+
+        return $phone;
+    }
+
+    /**
+     * Find orders by email, phone number OR Plus Code
+     * This allows matching customers who use different email addresses
+     * Plus Code identifies the delivery location (same address = same customer)
+     * Supports both legacy (posts/postmeta) and HPOS (wc_orders) storage
+     */
+    private function findOrdersByEmailPhoneOrPlusCode(string $email, string $normalized_phone, string $plus_code = '', string $start_date = ''): array {
+        global $wpdb;
+
+        $orders = [];
+        $found_order_ids = [];
+
+        // Check if HPOS is enabled
+        $hpos_enabled = get_option('woocommerce_custom_orders_table_enabled') === 'yes';
+
+        // Status filter
+        $statuses = ['wc-processing', 'wc-completed', 'wc-on-hold'];
+
+        if ($hpos_enabled) {
+            // HPOS: Use wc_orders and wc_order_addresses tables
+            $date_filter = '';
+            if (!empty($start_date)) {
+                $date_filter = $wpdb->prepare(" AND o.date_created_gmt >= %s", $start_date);
+            }
+
+            // Search by EMAIL (HPOS)
+            if (!empty($email) && is_email($email)) {
+                $email_query = $wpdb->prepare(
+                    "SELECT DISTINCT o.id FROM {$wpdb->prefix}wc_orders o
+                     INNER JOIN {$wpdb->prefix}wc_order_addresses oa ON o.id = oa.order_id AND oa.address_type = 'billing'
+                     WHERE o.type = 'shop_order'
+                     AND o.status IN ('wc-processing', 'wc-completed', 'wc-on-hold')
+                     AND oa.email = %s
+                     $date_filter
+                     ORDER BY o.date_created_gmt DESC",
+                    $email
+                );
+
+                $email_results = $wpdb->get_col($email_query);
+                foreach ($email_results as $order_id) {
+                    $found_order_ids[$order_id] = true;
+                }
+            }
+
+            // Search by PHONE (HPOS)
+            if (!empty($normalized_phone)) {
+                $phone_query = "SELECT DISTINCT o.id, oa.phone FROM {$wpdb->prefix}wc_orders o
+                     INNER JOIN {$wpdb->prefix}wc_order_addresses oa ON o.id = oa.order_id AND oa.address_type = 'billing'
+                     WHERE o.type = 'shop_order'
+                     AND o.status IN ('wc-processing', 'wc-completed', 'wc-on-hold')
+                     AND oa.phone != ''
+                     $date_filter
+                     ORDER BY o.date_created_gmt DESC
+                     LIMIT 500";
+
+                $phone_results = $wpdb->get_results($phone_query);
+                foreach ($phone_results as $row) {
+                    $order_normalized = $this->normalizePhoneNumber($row->phone);
+                    if ($order_normalized === $normalized_phone) {
+                        $found_order_ids[$row->id] = true;
+                    }
+                }
+            }
+
+            // Search by PLUS CODE (HPOS)
+            if (!empty($plus_code)) {
+                // Search in wc_orders_meta for plus code (try multiple meta keys)
+                $plus_code_query = $wpdb->prepare(
+                    "SELECT DISTINCT o.id FROM {$wpdb->prefix}wc_orders o
+                     INNER JOIN {$wpdb->prefix}wc_orders_meta om ON o.id = om.order_id
+                     WHERE o.type = 'shop_order'
+                     AND o.status IN ('wc-processing', 'wc-completed', 'wc-on-hold')
+                     AND om.meta_key IN ('_billing_plus_code', 'plus_code', 'lpac_plus_code')
+                     AND om.meta_value = %s
+                     $date_filter
+                     ORDER BY o.date_created_gmt DESC",
+                    $plus_code
+                );
+
+                $plus_code_results = $wpdb->get_col($plus_code_query);
+                foreach ($plus_code_results as $order_id) {
+                    $found_order_ids[$order_id] = true;
+                }
+            }
+        } else {
+            // Legacy: Use posts/postmeta tables
+            $date_filter = '';
+            if (!empty($start_date)) {
+                $date_filter = $wpdb->prepare(" AND p.post_date >= %s", $start_date);
+            }
+
+            $status_placeholders = implode(',', array_fill(0, count($statuses), '%s'));
+
+            // Search by EMAIL (Legacy)
+            if (!empty($email) && is_email($email)) {
+                $email_query = $wpdb->prepare(
+                    "SELECT DISTINCT p.ID FROM {$wpdb->posts} p
+                     INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id
+                     WHERE p.post_type = 'shop_order'
+                     AND p.post_status IN ($status_placeholders)
+                     AND pm.meta_key = '_billing_email'
+                     AND pm.meta_value = %s
+                     $date_filter
+                     ORDER BY p.post_date DESC",
+                    array_merge($statuses, [$email])
+                );
+
+                $email_results = $wpdb->get_col($email_query);
+                foreach ($email_results as $order_id) {
+                    $found_order_ids[$order_id] = true;
+                }
+            }
+
+            // Search by PHONE (Legacy)
+            if (!empty($normalized_phone)) {
+                $phone_query = $wpdb->prepare(
+                    "SELECT DISTINCT p.ID, pm.meta_value as phone FROM {$wpdb->posts} p
+                     INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id
+                     WHERE p.post_type = 'shop_order'
+                     AND p.post_status IN ($status_placeholders)
+                     AND pm.meta_key = '_billing_phone'
+                     AND pm.meta_value != ''
+                     $date_filter
+                     ORDER BY p.post_date DESC
+                     LIMIT 500",
+                    $statuses
+                );
+
+                $phone_results = $wpdb->get_results($phone_query);
+                foreach ($phone_results as $row) {
+                    $order_normalized = $this->normalizePhoneNumber($row->phone);
+                    if ($order_normalized === $normalized_phone) {
+                        $found_order_ids[$row->ID] = true;
+                    }
+                }
+            }
+
+            // Search by PLUS CODE (Legacy)
+            if (!empty($plus_code)) {
+                $plus_code_query = $wpdb->prepare(
+                    "SELECT DISTINCT p.ID FROM {$wpdb->posts} p
+                     INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id
+                     WHERE p.post_type = 'shop_order'
+                     AND p.post_status IN ($status_placeholders)
+                     AND pm.meta_key IN ('_billing_plus_code', 'plus_code', 'lpac_plus_code')
+                     AND pm.meta_value = %s
+                     $date_filter
+                     ORDER BY p.post_date DESC",
+                    array_merge($statuses, [$plus_code])
+                );
+
+                $plus_code_results = $wpdb->get_col($plus_code_query);
+                foreach ($plus_code_results as $order_id) {
+                    $found_order_ids[$order_id] = true;
+                }
+            }
+        }
+
+        // Convert to WC_Order objects
+        foreach (array_keys($found_order_ids) as $order_id) {
+            $order = wc_get_order($order_id);
+            if ($order) {
+                $orders[] = $order;
+            }
+        }
+
+        // Sort by date descending
+        usort($orders, function($a, $b) {
+            return $b->get_date_created()->getTimestamp() - $a->get_date_created()->getTimestamp();
+        });
+
+        return $orders;
+    }
+
     /**
      * AJAX: Pfand zurückerstatten
      */
@@ -5784,11 +5996,24 @@ class DispatchDashboard {
             $total_credit += floatval($item['amount']);
         }
         
-        // Berechne Abzug für fehlende Flaschen
+        // Berechne Abzug für fehlende Flaschen - DYNAMISCH aus Einstellungen
+        $pfand_items_config = get_option('dispatch_pfand_items', [
+            ['id' => 'water', 'icon' => '🍼', 'name' => 'Wasserflasche', 'amount' => 0.25, 'active' => true],
+            ['id' => 'beer', 'icon' => '🍺', 'name' => 'Bierflasche', 'amount' => 0.50, 'active' => true]
+        ]);
+
+        // Erstelle Lookup-Array für Pfand-Preise nach ID und Name
+        $pfand_prices = [];
+        foreach ($pfand_items_config as $item) {
+            if (isset($item['active']) && !$item['active']) continue;
+            $pfand_prices[$item['id']] = floatval($item['amount']);
+            $pfand_prices[$item['name']] = floatval($item['amount']);
+        }
+
         foreach ($missing_bottles as $bottle_type => $quantity) {
             if ($quantity > 0) {
-                // Hier könnten die Pfand-Preise aus den Einstellungen geholt werden
-                $bottle_price = ($bottle_type === 'Wasserflasche') ? 0.25 : 0.50;
+                // Hole Preis aus Einstellungen, Fallback auf 0.25
+                $bottle_price = isset($pfand_prices[$bottle_type]) ? $pfand_prices[$bottle_type] : 0.25;
                 $total_deduction += $quantity * $bottle_price;
             }
         }
@@ -15243,6 +15468,7 @@ class DispatchDashboard {
     
     /**
      * AJAX: Get SumUp Credentials for current driver
+     * Returns affiliate_key and app_identifier for iOS/Android integration
      */
     public function ajaxGetSumUpCredentials(): void {
         Dispatch_Security::verify_driver_access(true);
@@ -15267,8 +15493,12 @@ class DispatchDashboard {
             return;
         }
 
+        // Get App Identifier for Android (required for URL scheme)
+        $app_identifier = get_option('dispatch_sumup_app_identifier', '');
+
         wp_send_json_success([
-            'affiliate_key' => $affiliate_key
+            'affiliate_key' => $affiliate_key,
+            'app_identifier' => $app_identifier
         ]);
     }
 
@@ -27119,7 +27349,7 @@ class DispatchDashboard {
                             </button>
                             ` : ''}
 
-                            <button class="action-button payment" onclick="openSumUpPayment(${order.order_id}, '${formatPrice(order.net_payment || order.total)}')">
+                            <button class="action-button payment" onclick="openSumUpPayment(${order.order_id}, '${formatPrice(order.net_payment || order.total)}', '${order.customer_name || ''}')">
                                 <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
                                     <path d="M20 4H4c-1.11 0-1.99.89-1.99 2L2 18c0 1.11.89 2 2 2h16c1.11 0 2-.89 2-2V6c0-1.11-.89-2-2-2zm0 14H4v-6h16v6zm0-10H4V6h16v2z"/>
                                 </svg>
@@ -28452,54 +28682,55 @@ class DispatchDashboard {
                     return html;
                 }
 
+                // Pfand-Items aus den Einstellungen laden (dynamisch aus DB)
+                const pfandItemsConfig = <?php
+                    $pfand_items = get_option('dispatch_pfand_items', [
+                        ['id' => 'water', 'icon' => '🍼', 'name' => 'Wasserflasche', 'amount' => 0.25, 'active' => true],
+                        ['id' => 'beer', 'icon' => '🍺', 'name' => 'Bierflasche', 'amount' => 0.50, 'active' => true]
+                    ]);
+                    // Nur aktive Items
+                    $active_items = array_filter($pfand_items, function($item) {
+                        return !isset($item['active']) || $item['active'] === true;
+                    });
+                    echo json_encode(array_values($active_items), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
+                ?>;
+
                 function generateMissingBottlesHTML() {
+                    if (!pfandItemsConfig || pfandItemsConfig.length === 0) {
+                        return ''; // Keine Pfand-Items konfiguriert
+                    }
+
+                    let itemsHTML = '';
+                    pfandItemsConfig.forEach(item => {
+                        itemsHTML += `
+                            <div class="pfand-item-row" style="background:white; padding:10px; border-radius:5px;" data-pfand-id="${item.id}" data-pfand-amount="${item.amount}">
+                                <div class="pfand-item-name">
+                                    <div style="flex:1;">
+                                        <div style="color:#374151; font-size:1rem; font-weight:500;">${item.icon} ${item.name}</div>
+                                        <div style="color:#6b7280; font-size:0.875rem; margin-top:4px;">€${parseFloat(item.amount).toFixed(2)}/Stück</div>
+                                    </div>
+                                </div>
+                                <div class="pfand-item-controls">
+                                    <div class="pfand-quantity-control">
+                                        <button type="button" class="pfand-quantity-btn missing-btn minus" data-target="${item.id}" aria-label="Weniger ${item.name}">−</button>
+                                        <input type="number" id="missing-${item.id}" class="pfand-quantity-input missing-input" data-amount="${item.amount}" value="0" min="0" max="99" aria-label="Anzahl fehlende ${item.name}" readonly>
+                                        <button type="button" class="pfand-quantity-btn missing-btn plus" data-target="${item.id}" aria-label="Mehr ${item.name}">+</button>
+                                    </div>
+                                    <div style="min-width:80px; text-align:right;">
+                                        <div style="font-weight:bold; color:#dc3545; font-size:1rem;">€<span id="${item.id}-total">0.00</span></div>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    });
+
                     return `
                         <div id="missing-bottles-section" style="display:none; background:#fff3cd; border:1px solid #ffeaa7; padding:12px; border-radius:8px; margin-bottom:12px;">
                             <h4 style="margin:0 0 8px 0; color:#856404; font-size:1rem;">⚠️ Fehlende Flaschen</h4>
                             <p style="margin:0 0 12px 0; color:#856404; font-size:0.875rem;">Abzug für fehlende Flaschen eingeben:</p>
-
                             <div style="display:flex; flex-direction:column; gap:12px;">
-                                <!-- Wasserflasche -->
-                                <div class="pfand-item-row" style="background:white; padding:10px; border-radius:5px;">
-                                    <div class="pfand-item-name">
-                                        <div style="flex:1;">
-                                            <div style="color:#374151; font-size:1rem; font-weight:500;">🍼 Wasserflasche</div>
-                                            <div style="color:#6b7280; font-size:0.875rem; margin-top:4px;">€0.25/Stück</div>
-                                        </div>
-                                    </div>
-                                    <div class="pfand-item-controls">
-                                        <div class="pfand-quantity-control">
-                                            <button type="button" class="pfand-quantity-btn missing-btn minus" data-target="water" aria-label="Weniger Wasserflaschen">−</button>
-                                            <input type="number" id="missing-water" class="pfand-quantity-input" value="0" min="0" max="99" aria-label="Anzahl fehlende Wasserflaschen" readonly>
-                                            <button type="button" class="pfand-quantity-btn missing-btn plus" data-target="water" aria-label="Mehr Wasserflaschen">+</button>
-                                        </div>
-                                        <div style="min-width:80px; text-align:right;">
-                                            <div style="font-weight:bold; color:#dc3545; font-size:1rem;">€<span id="water-total">0.00</span></div>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <!-- Bierflasche -->
-                                <div class="pfand-item-row" style="background:white; padding:10px; border-radius:5px;">
-                                    <div class="pfand-item-name">
-                                        <div style="flex:1;">
-                                            <div style="color:#374151; font-size:1rem; font-weight:500;">🍺 Bierflasche</div>
-                                            <div style="color:#6b7280; font-size:0.875rem; margin-top:4px;">€0.50/Stück</div>
-                                        </div>
-                                    </div>
-                                    <div class="pfand-item-controls">
-                                        <div class="pfand-quantity-control">
-                                            <button type="button" class="pfand-quantity-btn missing-btn minus" data-target="beer" aria-label="Weniger Bierflaschen">−</button>
-                                            <input type="number" id="missing-beer" class="pfand-quantity-input" value="0" min="0" max="99" aria-label="Anzahl fehlende Bierflaschen" readonly>
-                                            <button type="button" class="pfand-quantity-btn missing-btn plus" data-target="beer" aria-label="Mehr Bierflaschen">+</button>
-                                        </div>
-                                        <div style="min-width:80px; text-align:right;">
-                                            <div style="font-weight:bold; color:#dc3545; font-size:1rem;">€<span id="beer-total">0.00</span></div>
-                                        </div>
-                                    </div>
-                                </div>
+                                ${itemsHTML}
                             </div>
-
                             <div id="missing-summary" style="display:none; text-align:right; margin-top:15px; padding-top:15px; border-top:1px solid #ffeaa7;">
                                 <strong style="color:#dc3545;">Abzug für fehlende Flaschen: <span id="missing-total">€0.00</span></strong>
                             </div>
@@ -28766,40 +28997,29 @@ class DispatchDashboard {
                         }
                     });
 
-                    // Berechne fehlende Flaschen Abzug
+                    // Berechne fehlende Flaschen Abzug - DYNAMISCH aus Einstellungen
                     let totalDeduction = 0;
-                    const missingWater = parseInt($('#missing-water').val()) || 0;
-                    const missingBeer = parseInt($('#missing-beer').val()) || 0;
 
-                    // Update individual bottle totals
-                    const waterTotal = missingWater * 0.25;
-                    const beerTotal = missingBeer * 0.50;
-                    $('#water-total').text(waterTotal.toFixed(2));
-                    $('#beer-total').text(beerTotal.toFixed(2));
+                    // Iteriere über alle konfigurierten Pfand-Items
+                    pfandItemsConfig.forEach(item => {
+                        const missingCount = parseInt($('#missing-' + item.id).val()) || 0;
+                        const itemAmount = parseFloat(item.amount) || 0;
+                        const itemTotal = missingCount * itemAmount;
 
-                    if (missingWater > 0) {
-                        const deduction = missingWater * 0.25;
-                        totalDeduction += deduction;
-                        summaryItems.push({
-                            name: 'Fehlende Wasserflaschen',
-                            quantity: missingWater,
-                            price: -0.25,
-                            total: -deduction,
-                            isDeduction: true
-                        });
-                    }
+                        // Update individual item total display
+                        $('#' + item.id + '-total').text(itemTotal.toFixed(2));
 
-                    if (missingBeer > 0) {
-                        const deduction = missingBeer * 0.50;
-                        totalDeduction += deduction;
-                        summaryItems.push({
-                            name: 'Fehlende Bierflaschen',
-                            quantity: missingBeer,
-                            price: -0.50,
-                            total: -deduction,
-                            isDeduction: true
-                        });
-                    }
+                        if (missingCount > 0) {
+                            totalDeduction += itemTotal;
+                            summaryItems.push({
+                                name: 'Fehlende ' + item.name,
+                                quantity: missingCount,
+                                price: -itemAmount,
+                                total: -itemTotal,
+                                isDeduction: true
+                            });
+                        }
+                    });
 
                     const netCredit = Math.max(0, totalCredit - totalDeduction);
 
@@ -31062,7 +31282,7 @@ class DispatchDashboard {
                 }
             }
 
-            function openSumUpPayment(orderId, amount) {
+            function openSumUpPayment(orderId, amount, customerName = '') {
                 // Remove € symbol and format as decimal for SumUp (uses decimal, NOT cents!)
                 const numericAmount = parseFloat(amount.replace('€', '').replace(',', '.').trim());
                 // Format with 2 decimal places (e.g., 81.82)
@@ -31070,6 +31290,15 @@ class DispatchDashboard {
 
                 // Get current user's SumUp affiliate key from user meta
                 const userId = '<?php echo get_current_user_id(); ?>';
+
+                // Detect platform (iOS vs Android)
+                const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+                const isAndroid = /Android/.test(navigator.userAgent);
+
+                // Build title with customer name (shown in SumUp app description field)
+                const title = customerName
+                    ? encodeURIComponent(customerName)
+                    : encodeURIComponent('Bestellung ' + orderId);
 
                 // Fetch user's SumUp credentials
                 fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
@@ -31085,13 +31314,27 @@ class DispatchDashboard {
                 .then(response => response.json())
                 .then(data => {
                     if (data.success && data.data.affiliate_key) {
-                        // Build SumUp URL - uses 'amount' parameter with decimal format
-                        // See: https://github.com/sumup/sumup-ios-url-scheme
-                        const callbackSuccess = encodeURIComponent(window.location.href + '?sumup_success=1&order_id=' + orderId);
-                        const callbackFail = encodeURIComponent(window.location.href + '?sumup_fail=1&order_id=' + orderId);
+                        let sumupUrl;
+                        const baseUrl = window.location.origin + window.location.pathname;
 
-                        const sumupUrl = `sumupmerchant://pay/1.0?affiliate-key=${data.data.affiliate_key}&amount=${formattedAmount}&currency=EUR&title=Bestellung%20${orderId}&callbacksuccess=${callbackSuccess}&callbackfail=${callbackFail}&foreign-tx-id=${orderId}&skip-screen-success=true`;
+                        if (isAndroid) {
+                            // Android: Uses single 'callback' parameter and 'total' instead of 'amount'
+                            // Also requires 'app-id' parameter
+                            // See: https://github.com/sumup/sumup-android-api
+                            const callback = encodeURIComponent(baseUrl + '?sumup_callback=1&order_id=' + orderId);
+                            const appId = data.data.app_identifier || 'es.entregamos-bebidas.dispatch';
 
+                            sumupUrl = `sumupmerchant://pay/1.0?affiliate-key=${data.data.affiliate_key}&app-id=${appId}&total=${formattedAmount}&currency=EUR&title=${title}&callback=${callback}&foreign-tx-id=${orderId}`;
+                        } else {
+                            // iOS: Uses separate 'callbacksuccess' and 'callbackfail' parameters
+                            // See: https://github.com/sumup/sumup-ios-url-scheme
+                            const callbackSuccess = encodeURIComponent(baseUrl + '?sumup_success=1&order_id=' + orderId);
+                            const callbackFail = encodeURIComponent(baseUrl + '?sumup_fail=1&order_id=' + orderId);
+
+                            sumupUrl = `sumupmerchant://pay/1.0?affiliate-key=${data.data.affiliate_key}&amount=${formattedAmount}&currency=EUR&title=${title}&callbacksuccess=${callbackSuccess}&callbackfail=${callbackFail}&foreign-tx-id=${orderId}&skip-screen-success=true`;
+                        }
+
+                        console.log('Platform:', isAndroid ? 'Android' : (isIOS ? 'iOS' : 'Unknown'));
                         console.log('Opening SumUp with URL:', sumupUrl);
                         window.location.href = sumupUrl;
                     } else {
@@ -31104,9 +31347,11 @@ class DispatchDashboard {
                 });
             }
 
-            // Handle SumUp callback
+            // Handle SumUp callback (iOS and Android)
             window.addEventListener('load', function() {
                 const urlParams = new URLSearchParams(window.location.search);
+
+                // iOS callbacks: sumup_success / sumup_fail
                 if (urlParams.has('sumup_success')) {
                     const orderId = urlParams.get('order_id');
                     alert('✅ Zahlung erfolgreich!');
@@ -31131,6 +31376,43 @@ class DispatchDashboard {
                     alert('❌ Zahlung fehlgeschlagen oder abgebrochen');
                     // Remove URL parameters
                     window.location.href = window.location.pathname;
+                }
+                // Android callback: sumup_callback with smp-status parameter
+                else if (urlParams.has('sumup_callback')) {
+                    const orderId = urlParams.get('order_id');
+                    const smpStatus = urlParams.get('smp-status');
+                    const smpMessage = urlParams.get('smp-message');
+                    const smpTxCode = urlParams.get('smp-tx-code');
+
+                    console.log('SumUp Android Callback:', { smpStatus, smpMessage, smpTxCode, orderId });
+
+                    if (smpStatus === 'success') {
+                        alert('✅ Zahlung erfolgreich!' + (smpTxCode ? ' (TX: ' + smpTxCode + ')' : ''));
+
+                        // Mark payment as received
+                        fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/x-www-form-urlencoded',
+                            },
+                            body: new URLSearchParams({
+                                action: 'mark_sumup_payment',
+                                order_id: orderId,
+                                status: 'paid',
+                                tx_code: smpTxCode || ''
+                            })
+                        })
+                        .then(() => {
+                            // Remove URL parameters and reload
+                            window.location.href = window.location.pathname;
+                        });
+                    } else {
+                        // smp-status is 'failed' or other
+                        const failureMsg = smpMessage || 'Zahlung fehlgeschlagen oder abgebrochen';
+                        alert('❌ ' + failureMsg);
+                        // Remove URL parameters
+                        window.location.href = window.location.pathname;
+                    }
                 }
             });
 
@@ -39577,6 +39859,16 @@ Ihr Lieferteam',
             error_log('plusCodeToCoordinates: Exception - ' . $e->getMessage());
             return null;
         }
+    }
+
+    /**
+     * Decode Plus Code to coordinates (alias for plusCodeToCoordinates)
+     *
+     * @param string $plus_code Plus Code string
+     * @return array|null Array with 'lat' and 'lng' keys, or null on failure
+     */
+    private function decodePlusCode(string $plus_code): ?array {
+        return $this->plusCodeToCoordinates($plus_code);
     }
 
     /**
