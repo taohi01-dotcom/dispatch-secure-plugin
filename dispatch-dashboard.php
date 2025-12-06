@@ -16481,13 +16481,13 @@ class DispatchDashboard {
         // Get all drivers
         $drivers = get_users([
             'role' => 'lieferfahrer',
-            'fields' => ['ID']
+            'fields' => 'ID'  // Returns array of IDs as integers
         ]);
 
         $checked_count = 0;
 
-        foreach ($drivers as $driver) {
-            $driver_id = $driver->ID;
+        foreach ($drivers as $driver_id) {
+            // $driver_id is now directly the ID (integer)
 
             // Check if driver has Traccar device
             $traccar_device_id = get_user_meta($driver_id, 'traccar_device_id', true);
