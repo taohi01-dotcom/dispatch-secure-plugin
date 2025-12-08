@@ -4,6 +4,77 @@ Alle wichtigen Änderungen am Dispatch SECURE Plugin werden hier dokumentiert.
 
 ---
 
+## [2.9.78] - 2025-12-08
+
+### 🔧 AUTO-FIX: Automatische KM/ETA Berechnung bei Order-Updates
+
+#### ❌ Problem
+- KM/ETA wurden nicht angezeigt, obwohl Plus Code im Kundenprofil vorhanden war
+- Die Berechnung wurde nur bei **Bestellungserstellung** ausgeführt
+- Wenn Admin den Plus Code **später** im Kundenprofil hinterlegt hat → keine Neuberechnung
+- Bestellungen #60541, #60542 hatten Koordinaten, aber keine KM/ETA
+
+#### 🔍 Ursache
+- `ensurePlusCodeForOrder()` wurde nur über `woocommerce_new_order` Hook aufgerufen
+- Bei nachträglicher Plus Code Eingabe im Kundenprofil wurde keine Berechnung ausgelöst
+- Depot-Koordinaten wurden unter falschem Option-Namen gesucht (`dispatch_warehouse_*` statt `dispatch_depot_*`)
+
+#### ✅ Lösung: Neue Funktion `maybeCalculateDistanceForOrder()`
+
+**Logik bei jeder Bestellung:**
+
+1. **Bestellung kommt rein** → Plus Code im Benutzerprofil prüfen
+2. **Distanz/ETA berechnen** (IMMER wenn Koordinaten vorhanden)
+3. **Falls kein Plus Code im Profil** → Lieferadresse dann Rechnungsadresse prüfen
+4. **Bei >100m Abweichung vom Profil-Plus Code** → Warnung an Admin
+
+**Technische Umsetzung:**
+
+```php
+private function maybeCalculateDistanceForOrder($order): void {
+    // 1. Prüfe ob KM/ETA bereits berechnet
+    $existing_distance = $order->get_meta('lpac_customer_distance');
+    if (!empty($existing_distance) && floatval($existing_distance) > 0) {
+        return; // Bereits vorhanden, überspringen
+    }
+
+    // 2. Koordinaten aus Bestellung holen
+    $customer_lat = $order->get_meta('billing_latitude');
+    $customer_lng = $order->get_meta('billing_longitude');
+
+    // 3. Falls keine Koordinaten → Plus Code aus Kundenprofil holen
+    if (empty($customer_lat) || empty($customer_lng)) {
+        $user_plus_code = get_user_meta($customer_id, 'plus_code', true);
+        // Dekodieren und Koordinaten speichern...
+    }
+
+    // 4. OSRM Berechnung (Fallback: Haversine)
+    // 5. Alle Meta-Keys speichern für LPAC-Kompatibilität
+}
+```
+
+**Aufruf:** In `clearCacheForUpdatedOrder()` eingefügt - wird bei JEDEM Order-Update ausgeführt.
+
+#### 📊 Auswirkung
+- ✅ KM/ETA wird automatisch berechnet wenn Plus Code später hinzugefügt wird
+- ✅ Bei jedem Order-Update wird geprüft ob Berechnung fehlt
+- ✅ Depot-Koordinaten werden aus `dispatch_depot_latitude/longitude` gelesen
+- ✅ OSRM für genaue Straßenentfernung (Fallback: Haversine Luftlinie)
+- ✅ Alle LPAC Meta-Keys werden gesetzt für Anzeige in WooCommerce
+
+#### 🧪 Getestet mit
+- Bestellung #60541: KM/ETA gelöscht → automatisch neu berechnet: 41,6 km / 46 mins
+- Bestellung #60542: KM/ETA gelöscht → automatisch neu berechnet: 34 km / 29 mins
+- `_dispatch_distance_calculated: osrm` ✅
+- `_dispatch_distance_calculated_at: 2025-12-08 14:54:32` ✅
+
+#### 📁 Geänderte Dateien
+- `dispatch-dashboard.php`:
+  - Neue Funktion `maybeCalculateDistanceForOrder()` (nach Zeile 40214)
+  - Aufruf in `clearCacheForUpdatedOrder()` (Zeile 40429)
+
+---
+
 ## [2.9.77] - 2025-12-06
 
 ### 🐛 KRITISCHER BUGFIX: Fatal Error `decodePlusCode()`

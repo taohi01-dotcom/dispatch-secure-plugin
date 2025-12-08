@@ -1,9 +1,9 @@
 <?php
 /**
- * Plugin Name: Dispatch SECURE v2.9.74
+ * Plugin Name: Dispatch SECURE v2.9.76
  * Plugin URI: https://your-domain.de
- * Description: Enhanced routing map display & driver management improvements
- * Version: 2.9.74
+ * Description: Distance calculation fix - uses order coordinates when Plus Code not decoded
+ * Version: 2.9.76
  * Author: Ihr Name
  * License: GPL v2 or later
  * Requires PHP: 8.3
@@ -5998,8 +5998,8 @@ class DispatchDashboard {
         
         // Berechne Abzug für fehlende Flaschen - DYNAMISCH aus Einstellungen
         $pfand_items_config = get_option('dispatch_pfand_items', [
-            ['id' => 'water', 'icon' => '🍼', 'name' => 'Wasserflasche', 'amount' => 0.25, 'active' => true],
-            ['id' => 'beer', 'icon' => '🍺', 'name' => 'Bierflasche', 'amount' => 0.50, 'active' => true]
+            ['id' => 'water', 'icon' => '🍼', 'name' => 'Wasserflasche', 'amount' => 0.50, 'active' => true],
+            ['id' => 'beer', 'icon' => '🍺', 'name' => 'Bierflasche', 'amount' => 0.25, 'active' => true]
         ]);
 
         // Erstelle Lookup-Array für Pfand-Preise nach ID und Name
@@ -28685,8 +28685,8 @@ class DispatchDashboard {
                 // Pfand-Items aus den Einstellungen laden (dynamisch aus DB)
                 const pfandItemsConfig = <?php
                     $pfand_items = get_option('dispatch_pfand_items', [
-                        ['id' => 'water', 'icon' => '🍼', 'name' => 'Wasserflasche', 'amount' => 0.25, 'active' => true],
-                        ['id' => 'beer', 'icon' => '🍺', 'name' => 'Bierflasche', 'amount' => 0.50, 'active' => true]
+                        ['id' => 'water', 'icon' => '🍼', 'name' => 'Wasserflasche', 'amount' => 0.50, 'active' => true],
+                        ['id' => 'beer', 'icon' => '🍺', 'name' => 'Bierflasche', 'amount' => 0.25, 'active' => true]
                     ]);
                     // Nur aktive Items
                     $active_items = array_filter($pfand_items, function($item) {
@@ -40096,9 +40096,15 @@ Ihr Lieferteam',
         // ========================================
         // STEP 4: ALWAYS calculate distance/ETA if coordinates available
         // ========================================
-        $existing_distance = $order->get_meta('lpac_customer_distance');
+        // Use order_coordinates if coordinates from Plus Code is empty
+        $calc_coordinates = $coordinates ?: $order_coordinates;
 
-        if (empty($existing_distance) && $coordinates) {
+        // Check multiple possible distance fields
+        $existing_distance = $order->get_meta('lpac_customer_distance')
+            ?: $order->get_meta('_delivery_distance_km')
+            ?: $order->get_meta('_route_distance');
+
+        if (empty($existing_distance) && $calc_coordinates) {
             // Get depot coordinates
             $settings = $this->getSettings();
             $depot_lat = $settings['depot_latitude'] ?? get_option('dispatch_depot_latitude', '39.4887003');
@@ -40108,18 +40114,26 @@ Ihr Lieferteam',
                 $route_data = $this->calculateDrivingDistance(
                     floatval($depot_lat),
                     floatval($depot_lng),
-                    $coordinates['lat'],
-                    $coordinates['lng'],
+                    $calc_coordinates['lat'],
+                    $calc_coordinates['lng'],
                     $order_id
                 );
 
                 if ($route_data && isset($route_data['distance_km'])) {
-                    $order->update_meta_data('lpac_customer_distance', round($route_data['distance_km'], 2));
+                    // Save to all commonly used meta keys for compatibility
+                    $distance_km = round($route_data['distance_km'], 1);
+                    $eta_minutes = round($route_data['duration_minutes']);
+
+                    $order->update_meta_data('lpac_customer_distance', $distance_km);
                     $order->update_meta_data('lpac_customer_distance_unit', 'km');
-                    $order->update_meta_data('lpac_customer_distance_duration', $route_data['duration_minutes'] . ' mins');
+                    $order->update_meta_data('lpac_customer_distance_duration', $eta_minutes . ' mins');
+                    $order->update_meta_data('_delivery_distance_km', $distance_km);
+                    $order->update_meta_data('_delivery_eta_minutes', $eta_minutes);
+                    $order->update_meta_data('_route_distance', $distance_km);
+                    $order->update_meta_data('_route_duration', $eta_minutes);
                     $order->update_meta_data('_dispatch_distance_calculated', 'yes');
 
-                    error_log("ensurePlusCodeForOrder: Order #{$order_id} - Distance calculated: {$route_data['distance_km']} km, ETA: {$route_data['duration_minutes']} mins");
+                    error_log("ensurePlusCodeForOrder: Order #{$order_id} - Distance calculated: {$distance_km} km, ETA: {$eta_minutes} mins");
                 }
             }
         }
@@ -40197,6 +40211,125 @@ Ihr Lieferteam',
         $c = 2 * atan2(sqrt($a), sqrt(1 - $a));
 
         return $earth_radius * $c;
+    }
+
+    /**
+     * AUTO-FIX: Calculate KM/ETA if coordinates exist but distance is missing
+     * Called from clearCacheForUpdatedOrder to ensure KM/ETA is always calculated
+     * when Plus Code is added later by admin
+     *
+     * @param WC_Order $order
+     * @return void
+     */
+    private function maybeCalculateDistanceForOrder($order): void {
+        if (!$order) {
+            return;
+        }
+
+        $order_id = $order->get_id();
+
+        // Check if distance already calculated
+        $existing_distance = $order->get_meta('lpac_customer_distance');
+        if (!empty($existing_distance) && floatval($existing_distance) > 0) {
+            return; // Already has distance, skip
+        }
+
+        // Try to get coordinates from order
+        $customer_lat = $order->get_meta('billing_latitude') ?: $order->get_meta('lpac_latitude');
+        $customer_lng = $order->get_meta('billing_longitude') ?: $order->get_meta('lpac_longitude');
+
+        // If no coordinates in order, try to get from user profile Plus Code
+        if (empty($customer_lat) || empty($customer_lng)) {
+            $customer_id = $order->get_customer_id();
+            if ($customer_id > 0) {
+                // Check user's Plus Code - try plus_code first, then billing_pluscode
+                $user_plus_code = get_user_meta($customer_id, 'plus_code', true);
+                if (empty($user_plus_code) || $user_plus_code === 'NONE' || $user_plus_code === 'none') {
+                    $user_plus_code = get_user_meta($customer_id, 'billing_pluscode', true);
+                }
+
+                // Decode Plus Code if valid (must contain '+' and not be 'NONE')
+                if (!empty($user_plus_code) && $user_plus_code !== 'NONE' && $user_plus_code !== 'none' && strpos($user_plus_code, '+') !== false) {
+                    $coords = $this->decodePlusCode($user_plus_code);
+                    if ($coords) {
+                        $customer_lat = $coords['lat'];
+                        $customer_lng = $coords['lng'];
+
+                        // Save coordinates to order for future use
+                        $order->update_meta_data('billing_latitude', $customer_lat);
+                        $order->update_meta_data('billing_longitude', $customer_lng);
+                        $order->update_meta_data('plus_code', $user_plus_code);
+                        $order->update_meta_data('plus_code_source', 'user_profile_auto');
+                        error_log("maybeCalculateDistanceForOrder: Order #{$order_id} - Loaded Plus Code from user profile: {$user_plus_code}");
+                    }
+                }
+            }
+        }
+
+        // Still no coordinates? Nothing to calculate
+        if (empty($customer_lat) || empty($customer_lng)) {
+            return;
+        }
+
+        // Get depot coordinates from settings
+        $depot_lat = get_option('dispatch_depot_latitude', '39.4887003');
+        $depot_lng = get_option('dispatch_depot_longitude', '2.8970119');
+
+        if (empty($depot_lat) || empty($depot_lng)) {
+            error_log("maybeCalculateDistanceForOrder: Order #{$order_id} - Missing depot coordinates!");
+            return;
+        }
+
+        // Calculate distance using OSRM
+        $osrm_url = get_option('dispatch_osrm_api_url', 'http://91.98.17.58:5000');
+        $route_url = "{$osrm_url}/route/v1/driving/{$depot_lng},{$depot_lat};{$customer_lng},{$customer_lat}?overview=false";
+
+        $context = stream_context_create(['http' => ['timeout' => 5]]);
+        $response = @file_get_contents($route_url, false, $context);
+
+        if ($response !== false) {
+            $data = json_decode($response, true);
+            if (isset($data['routes'][0])) {
+                $route = $data['routes'][0];
+                $distance_km = round($route['distance'] / 1000, 1);
+                $eta_minutes = round($route['duration'] / 60);
+
+                // Save to order - all meta keys for compatibility
+                $order->update_meta_data('lpac_customer_distance', $distance_km);
+                $order->update_meta_data('lpac_customer_distance_unit', 'km');
+                $order->update_meta_data('lpac_customer_distance_duration', $eta_minutes . ' mins');
+                $order->update_meta_data('lpac_latitude', $customer_lat);
+                $order->update_meta_data('lpac_longitude', $customer_lng);
+                $order->update_meta_data('_delivery_distance_km', $distance_km);
+                $order->update_meta_data('_delivery_eta_minutes', $eta_minutes);
+                $order->update_meta_data('_dispatch_distance_calculated', 'osrm');
+                $order->update_meta_data('_dispatch_distance_calculated_at', current_time('mysql'));
+                $order->save();
+
+                error_log("✅ AUTO-FIX (OSRM): Order #{$order_id} - KM/ETA calculated: {$distance_km} km / {$eta_minutes} mins");
+                return;
+            }
+        }
+
+        // Fallback: Haversine calculation
+        $distance_km = $this->calculateHaversineDistance(
+            floatval($depot_lat), floatval($depot_lng),
+            floatval($customer_lat), floatval($customer_lng)
+        );
+        $eta_minutes = round(($distance_km / 40) * 60); // 40 km/h average
+
+        $order->update_meta_data('lpac_customer_distance', round($distance_km, 1));
+        $order->update_meta_data('lpac_customer_distance_unit', 'km');
+        $order->update_meta_data('lpac_customer_distance_duration', $eta_minutes . ' mins');
+        $order->update_meta_data('lpac_latitude', $customer_lat);
+        $order->update_meta_data('lpac_longitude', $customer_lng);
+        $order->update_meta_data('_delivery_distance_km', round($distance_km, 1));
+        $order->update_meta_data('_delivery_eta_minutes', $eta_minutes);
+        $order->update_meta_data('_dispatch_distance_calculated', 'haversine');
+        $order->update_meta_data('_dispatch_distance_calculated_at', current_time('mysql'));
+        $order->save();
+
+        error_log("✅ AUTO-FIX (Haversine): Order #{$order_id} - KM/ETA calculated: " . round($distance_km, 1) . " km / {$eta_minutes} mins");
     }
 
     /**
@@ -40288,6 +40421,12 @@ Ihr Lieferteam',
         if (!$order_id) {
             $order_id = $order->get_id();
         }
+
+        // ========================================
+        // AUTO-FIX: Calculate KM/ETA if missing but coordinates available
+        // This ensures KM/ETA is calculated when Plus Code is added later by admin
+        // ========================================
+        $this->maybeCalculateDistanceForOrder($order);
 
         // ========================================
         // DEBUG: Track which hook called this and check suppression
