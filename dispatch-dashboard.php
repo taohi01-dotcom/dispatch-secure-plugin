@@ -40234,34 +40234,87 @@ Ihr Lieferteam',
             return; // Already has distance, skip
         }
 
-        // Try to get coordinates from order
-        $customer_lat = $order->get_meta('billing_latitude') ?: $order->get_meta('lpac_latitude');
-        $customer_lng = $order->get_meta('billing_longitude') ?: $order->get_meta('lpac_longitude');
+        $customer_id = $order->get_customer_id();
+        $customer_lat = null;
+        $customer_lng = null;
+        $coord_source = null;
+        $user_plus_code = null;
 
-        // If no coordinates in order, try to get from user profile Plus Code
-        if (empty($customer_lat) || empty($customer_lng)) {
-            $customer_id = $order->get_customer_id();
-            if ($customer_id > 0) {
-                // Check user's Plus Code - try plus_code first, then billing_pluscode
-                $user_plus_code = get_user_meta($customer_id, 'plus_code', true);
-                if (empty($user_plus_code) || $user_plus_code === 'NONE' || $user_plus_code === 'none') {
-                    $user_plus_code = get_user_meta($customer_id, 'billing_pluscode', true);
+        // ========================================
+        // STEP 1: ZUERST Benutzerprofil prüfen (Plus Code)
+        // ========================================
+        if ($customer_id > 0) {
+            $user_plus_code = get_user_meta($customer_id, 'plus_code', true);
+            if (empty($user_plus_code) || $user_plus_code === 'NONE' || $user_plus_code === 'none') {
+                $user_plus_code = get_user_meta($customer_id, 'billing_pluscode', true);
+            }
+
+            // Decode Plus Code if valid (must contain '+' and not be 'NONE')
+            if (!empty($user_plus_code) && $user_plus_code !== 'NONE' && $user_plus_code !== 'none' && strpos($user_plus_code, '+') !== false) {
+                $coords = $this->decodePlusCode($user_plus_code);
+                if ($coords) {
+                    $customer_lat = $coords['lat'];
+                    $customer_lng = $coords['lng'];
+                    $coord_source = 'user_profile';
+
+                    // Save coordinates to order
+                    $order->update_meta_data('billing_latitude', $customer_lat);
+                    $order->update_meta_data('billing_longitude', $customer_lng);
+                    $order->update_meta_data('plus_code', $user_plus_code);
+                    $order->update_meta_data('plus_code_source', 'user_profile');
+                    error_log("maybeCalculateDistanceForOrder: Order #{$order_id} - STEP 1: Plus Code from user profile: {$user_plus_code}");
                 }
+            }
+        }
 
-                // Decode Plus Code if valid (must contain '+' and not be 'NONE')
-                if (!empty($user_plus_code) && $user_plus_code !== 'NONE' && $user_plus_code !== 'none' && strpos($user_plus_code, '+') !== false) {
-                    $coords = $this->decodePlusCode($user_plus_code);
-                    if ($coords) {
-                        $customer_lat = $coords['lat'];
-                        $customer_lng = $coords['lng'];
+        // ========================================
+        // STEP 2: Falls kein Plus Code im Profil → Lieferadresse prüfen
+        // ========================================
+        if (empty($customer_lat) || empty($customer_lng)) {
+            $shipping_lat = $order->get_meta('_shipping_latitude') ?: $order->get_meta('lpac_latitude');
+            $shipping_lng = $order->get_meta('_shipping_longitude') ?: $order->get_meta('lpac_longitude');
 
-                        // Save coordinates to order for future use
-                        $order->update_meta_data('billing_latitude', $customer_lat);
-                        $order->update_meta_data('billing_longitude', $customer_lng);
-                        $order->update_meta_data('plus_code', $user_plus_code);
-                        $order->update_meta_data('plus_code_source', 'user_profile_auto');
-                        error_log("maybeCalculateDistanceForOrder: Order #{$order_id} - Loaded Plus Code from user profile: {$user_plus_code}");
-                    }
+            if (!empty($shipping_lat) && !empty($shipping_lng)) {
+                $customer_lat = $shipping_lat;
+                $customer_lng = $shipping_lng;
+                $coord_source = 'shipping_address';
+                error_log("maybeCalculateDistanceForOrder: Order #{$order_id} - STEP 2: Coordinates from shipping address");
+            }
+        }
+
+        // ========================================
+        // STEP 3: Falls keine Lieferadresse → Rechnungsadresse prüfen
+        // ========================================
+        if (empty($customer_lat) || empty($customer_lng)) {
+            $billing_lat = $order->get_meta('billing_latitude');
+            $billing_lng = $order->get_meta('billing_longitude');
+
+            if (!empty($billing_lat) && !empty($billing_lng)) {
+                $customer_lat = $billing_lat;
+                $customer_lng = $billing_lng;
+                $coord_source = 'billing_address';
+                error_log("maybeCalculateDistanceForOrder: Order #{$order_id} - STEP 3: Coordinates from billing address");
+            }
+        }
+
+        // ========================================
+        // STEP 4: Bei >100m Abweichung vom Profil-Plus Code → Warnung
+        // ========================================
+        if (!empty($user_plus_code) && $coord_source !== 'user_profile') {
+            // We have profile Plus Code but used address coordinates
+            $profile_coords = $this->decodePlusCode($user_plus_code);
+            if ($profile_coords && !empty($customer_lat) && !empty($customer_lng)) {
+                $deviation_m = $this->calculateHaversineDistance(
+                    $profile_coords['lat'], $profile_coords['lng'],
+                    floatval($customer_lat), floatval($customer_lng)
+                ) * 1000; // Convert km to m
+
+                if ($deviation_m > 100) {
+                    error_log("⚠️ maybeCalculateDistanceForOrder: Order #{$order_id} - ADDRESS DEVIATION: {$deviation_m}m from profile Plus Code!");
+                    $order->add_order_note(sprintf(
+                        '⚠️ Adressabweichung: Die Lieferadresse weicht %dm vom Plus Code im Kundenprofil ab!',
+                        round($deviation_m)
+                    ));
                 }
             }
         }

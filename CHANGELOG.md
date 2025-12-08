@@ -23,33 +23,43 @@ Alle wichtigen Änderungen am Dispatch SECURE Plugin werden hier dokumentiert.
 
 **Logik bei jeder Bestellung:**
 
-1. **Bestellung kommt rein** → Plus Code im Benutzerprofil prüfen
-2. **Distanz/ETA berechnen** (IMMER wenn Koordinaten vorhanden)
-3. **Falls kein Plus Code im Profil** → Lieferadresse dann Rechnungsadresse prüfen
-4. **Bei >100m Abweichung vom Profil-Plus Code** → Warnung an Admin
+1. **STEP 1: ZUERST Benutzerprofil prüfen** → Plus Code dekodieren
+2. **STEP 2: Falls kein Plus Code** → Lieferadresse (shipping) prüfen
+3. **STEP 3: Falls keine Lieferadresse** → Rechnungsadresse (billing) prüfen
+4. **STEP 4: Abweichungs-Check** → Bei >100m Abweichung vom Profil-Plus Code → Warnung an Admin
+5. **Distanz/ETA berechnen** (IMMER wenn Koordinaten vorhanden)
 
 **Technische Umsetzung:**
 
 ```php
 private function maybeCalculateDistanceForOrder($order): void {
-    // 1. Prüfe ob KM/ETA bereits berechnet
-    $existing_distance = $order->get_meta('lpac_customer_distance');
-    if (!empty($existing_distance) && floatval($existing_distance) > 0) {
-        return; // Bereits vorhanden, überspringen
-    }
-
-    // 2. Koordinaten aus Bestellung holen
-    $customer_lat = $order->get_meta('billing_latitude');
-    $customer_lng = $order->get_meta('billing_longitude');
-
-    // 3. Falls keine Koordinaten → Plus Code aus Kundenprofil holen
-    if (empty($customer_lat) || empty($customer_lng)) {
+    // STEP 1: ZUERST Benutzerprofil prüfen (Plus Code)
+    if ($customer_id > 0) {
         $user_plus_code = get_user_meta($customer_id, 'plus_code', true);
-        // Dekodieren und Koordinaten speichern...
+        if (!empty($user_plus_code) && strpos($user_plus_code, '+') !== false) {
+            $coords = $this->decodePlusCode($user_plus_code);
+            // Koordinaten aus Plus Code verwenden...
+        }
     }
 
-    // 4. OSRM Berechnung (Fallback: Haversine)
-    // 5. Alle Meta-Keys speichern für LPAC-Kompatibilität
+    // STEP 2: Falls kein Plus Code → Lieferadresse prüfen
+    if (empty($customer_lat)) {
+        $shipping_lat = $order->get_meta('_shipping_latitude');
+        // ...
+    }
+
+    // STEP 3: Falls keine Lieferadresse → Rechnungsadresse prüfen
+    if (empty($customer_lat)) {
+        $billing_lat = $order->get_meta('billing_latitude');
+        // ...
+    }
+
+    // STEP 4: Bei >100m Abweichung vom Profil-Plus Code → Warnung
+    if ($deviation_m > 100) {
+        $order->add_order_note('⚠️ Adressabweichung: ...');
+    }
+
+    // OSRM Berechnung (Fallback: Haversine)
 }
 ```
 
