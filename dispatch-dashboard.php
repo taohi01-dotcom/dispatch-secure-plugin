@@ -1,13 +1,21 @@
 <?php
 /**
- * Plugin Name: Dispatch SECURE v2.9.76
+ * Plugin Name: Dispatch SECURE v2.9.79
  * Plugin URI: https://your-domain.de
- * Description: Distance calculation fix - uses order coordinates when Plus Code not decoded
- * Version: 2.9.76
+ * Description: SMS/Email notification fix - suppression bug resolved
+ * Version: 2.9.79
  * Author: Ihr Name
  * License: GPL v2 or later
  * Requires PHP: 8.3
  * Requires at least: 6.0
+ *
+ * SMS/EMAIL NOTIFICATION FIX v2.9.79 (2025-12-09):
+ * - FIXED: SMS/Email notifications were blocked by suppression flag when order marked as "geladen"
+ * - FIXED: Suppression flag now temporarily deleted before sending intended notification
+ * - FIXED: Suppression flag re-set after notification to prevent duplicates from other hooks
+ * - ADDED: Order notes now record SMS sent/failed/skipped status for tracking
+ * - ADDED: Order notes now record when "Fahrer unterwegs" email was triggered
+ * - RESULT: Customers now receive SMS and Email when driver marks order as loaded
  *
  * METADATA SYNC FIX v2.9.74 (2025-11-19):
  * - FIXED: ajaxUpdateOrderStatus now cleans up metadata when "geladen" status is removed
@@ -15264,11 +15272,19 @@ class DispatchDashboard {
 
                 // Save the order
                 $order->save();
-                // NOTE: Suppression flag set above - let it expire naturally after 60 seconds
-                // DO NOT delete the flag here! Multiple hooks fire async and need the flag
 
-                // Trigger email to customer with tracking link
+                // FIX v2.9.79: Temporarily delete suppression flag for INTENDED notification
+                // The flag was set to prevent duplicate notifications from save() hooks,
+                // but we need to allow the intended notification through
+                delete_transient('dispatch_suppress_notifications_' . $order_id);
+                error_log("✅ Suppression flag DELETED for order #{$order_id} - allowing intended notification");
+
+                // Trigger email AND SMS to customer with tracking link
                 do_action('dispatch_delivery_started_notification', $order_id, $order);
+
+                // Re-set suppression flag to prevent duplicate notifications from subsequent hooks
+                set_transient('dispatch_suppress_notifications_' . $order_id, true, 30);
+                error_log("🔒 Suppression flag RE-SET for order #{$order_id} - blocking duplicate notifications for 30 seconds");
 
                 // NOTE: Removed redundant save_meta_data() call here
                 // $order->save() already saved all meta data, and calling save_meta_data()
@@ -16169,19 +16185,41 @@ class DispatchDashboard {
 
             if ($result['success']) {
                 error_log("Dispatch SMS: ✅ SMS successfully sent to {$customer_phone} for order #{$order->get_order_number()}");
+                // FIX v2.9.79: Add order note for sent SMS
+                $order->add_order_note(sprintf(
+                    '📱 SMS "Fahrer unterwegs" gesendet an %s',
+                    $customer_phone
+                ));
             } else {
                 error_log("Dispatch SMS: ❌ SMS failed for order #{$order->get_order_number()}: " . $result['error']);
+                // FIX v2.9.79: Add order note for failed SMS
+                $order->add_order_note(sprintf(
+                    '❌ SMS-Versand fehlgeschlagen: %s (Nummer: %s)',
+                    $result['error'],
+                    $customer_phone
+                ));
             }
         } else {
             // Log why SMS was not sent
+            $skip_reason = '';
             if ($settings['enable_sms_notifications'] !== 'yes') {
                 error_log("Dispatch SMS: Skipped - SMS notifications disabled in settings");
+                $skip_reason = 'SMS deaktiviert';
             } elseif (empty($settings['twilio_account_sid'])) {
                 error_log("Dispatch SMS: Skipped - Twilio Account SID not configured");
+                $skip_reason = 'Twilio nicht konfiguriert';
             } elseif (!$sms_type_enabled) {
                 error_log("Dispatch SMS: Skipped - 'Fahrer unterwegs' SMS is disabled");
+                $skip_reason = '"Fahrer unterwegs" SMS deaktiviert';
+            }
+            // FIX v2.9.79: Add order note when SMS is skipped (only if there's a reason)
+            if (!empty($skip_reason)) {
+                $order->add_order_note(sprintf('ℹ️ SMS übersprungen: %s', $skip_reason));
             }
         }
+
+        // FIX v2.9.79: Note that WooCommerce Email was triggered
+        $order->add_order_note('📧 "Fahrer unterwegs" Email wurde getriggert');
     }
 
     /**

@@ -4,6 +4,55 @@ Alle wichtigen Änderungen am Dispatch SECURE Plugin werden hier dokumentiert.
 
 ---
 
+## [2.9.79] - 2025-12-09
+
+### 🔧 KRITISCHER BUGFIX: SMS/Email Benachrichtigungen wurden nicht gesendet
+
+#### ❌ Problem
+- Kunden erhielten **keine SMS und keine Email** wenn der Fahrer die Bestellung als "geladen" markierte
+- Im debug.log erschien: `🚫 SMS/WhatsApp SUPPRESSED for order #XXXXX - flag is active`
+- Der Suppression-Flag (zum Verhindern von Doppel-Benachrichtigungen) blockierte auch die **beabsichtigte** Benachrichtigung
+
+#### 🔍 Ursache
+Code-Flow war fehlerhaft:
+1. Zeile 15229: Suppression-Flag wird für 60 Sek gesetzt
+2. Zeile 15266: Order wird gespeichert
+3. Zeile 15271: `do_action('dispatch_delivery_started_notification')` wird aufgerufen
+4. SMS-Funktion prüft Flag → **NOCH AKTIV** → Return ohne SMS zu senden!
+
+#### ✅ Lösung
+
+**Fix 1: Suppression-Flag temporär löschen**
+```php
+// Vor der Benachrichtigung: Flag löschen
+delete_transient('dispatch_suppress_notifications_' . $order_id);
+
+// Benachrichtigung senden
+do_action('dispatch_delivery_started_notification', $order_id, $order);
+
+// Nach der Benachrichtigung: Flag wieder setzen (30 Sek)
+set_transient('dispatch_suppress_notifications_' . $order_id, true, 30);
+```
+
+**Fix 2: Order Notes für Nachverfolgbarkeit**
+- ✅ `📱 SMS "Fahrer unterwegs" gesendet an +49...`
+- ❌ `❌ SMS-Versand fehlgeschlagen: [Fehler] (Nummer: +49...)`
+- ℹ️ `ℹ️ SMS übersprungen: [Grund]`
+- 📧 `📧 "Fahrer unterwegs" Email wurde getriggert`
+
+#### 📊 Auswirkung
+- ✅ SMS wird jetzt korrekt gesendet wenn Fahrer "geladen" markiert
+- ✅ WooCommerce Email wird getriggert
+- ✅ Alle Benachrichtigungen sind in Order Notes nachvollziehbar
+- ✅ Doppelte Benachrichtigungen werden weiterhin verhindert
+
+#### 📁 Geänderte Dateien
+- `dispatch-dashboard.php`:
+  - Zeile 15268-15279: Suppression-Flag Handling korrigiert
+  - Zeile 16178-16214: Order Notes für SMS-Status hinzugefügt
+
+---
+
 ## [2.9.78] - 2025-12-08
 
 ### 🔧 AUTO-FIX: Automatische KM/ETA Berechnung bei Order-Updates
