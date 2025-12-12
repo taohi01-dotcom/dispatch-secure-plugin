@@ -4,6 +4,67 @@ Alle wichtigen Änderungen am Dispatch SECURE Plugin werden hier dokumentiert.
 
 ---
 
+## [2.9.85] - 2025-12-12
+
+### 🔧 FIX: Auto KM/ETA Berechnung bei Order-Updates
+
+#### ❌ Problem
+- KM/ETA wurden nicht angezeigt, obwohl Plus Code im Kundenprofil vorhanden war
+- Order #60924 hatte Plus Code `8FF4HJR5+27` aber keine Distanz-Berechnung
+- Die Funktion `maybeCalculateDistanceForOrder()` aus v2.9.78 fehlte auf dem Server
+
+#### 🔍 Ursache
+- Der Fix aus GitHub v2.9.78 wurde nicht auf den Server deployed
+- Server hatte v2.9.84 ohne die `maybeCalculateDistanceForOrder()` Funktion
+- `ensurePlusCodeForOrder()` wurde nur bei `woocommerce_new_order` aufgerufen
+- Bei nachträglicher Plus Code Eingabe im Kundenprofil → keine Neuberechnung
+
+#### ✅ Lösung
+
+**Neue Funktion `maybeCalculateDistanceForOrder()`:**
+```php
+private function maybeCalculateDistanceForOrder($order): void {
+    // STEP 1: ZUERST Benutzerprofil prüfen (Plus Code)
+    // STEP 2: Falls kein Plus Code → Lieferadresse prüfen
+    // STEP 3: Falls keine Lieferadresse → Rechnungsadresse prüfen
+    // STEP 4: Bei >100m Abweichung vom Profil-Plus Code → Warnung
+    // OSRM Berechnung (Fallback: Haversine)
+}
+```
+
+**Aufruf in `clearCacheForUpdatedOrder()`:**
+```php
+// AUTO-FIX: Calculate KM/ETA if missing but coordinates available
+$this->maybeCalculateDistanceForOrder($order);
+```
+
+**Korrektur Funktionsname:**
+- GitHub: `$this->decodePlusCode()` 
+- Server: `$this->plusCodeToCoordinates()` ✅
+
+#### 📊 Ergebnis für Order #60924
+| Feld | Vorher | Nachher |
+|------|--------|---------|
+| lpac_customer_distance | LEER | **33.4 km** |
+| lpac_customer_distance_duration | LEER | **27 mins** |
+| _dispatch_distance_calculated | LEER | **osrm** |
+| billing_latitude | LEER | **39.5900625** |
+| billing_longitude | LEER | **2.6081875** |
+
+#### 🧪 Getestet
+```log
+[12-Dec-2025 08:34:12 UTC] plusCodeToCoordinates: SUCCESS - 8FF4HJR5+27 → lat=39.5900625, lng=2.6081875
+[12-Dec-2025 08:34:12 UTC] maybeCalculateDistanceForOrder: Order #60924 - STEP 1: Plus Code from user profile: 8FF4HJR5+27
+[12-Dec-2025 08:34:12 UTC] ✅ AUTO-FIX (OSRM): Order #60924 - KM/ETA calculated: 33.4 km / 27 mins (source: user_profile)
+```
+
+#### 📁 Geänderte Dateien
+- `dispatch-dashboard.php`:
+  - Neue Funktion `maybeCalculateDistanceForOrder()` (Zeile 40220)
+  - Aufruf in `clearCacheForUpdatedOrder()` (Zeile 40479)
+
+---
+
 ## [2.9.79] - 2025-12-09
 
 ### 🔧 KRITISCHER BUGFIX: SMS/Email Benachrichtigungen wurden nicht gesendet

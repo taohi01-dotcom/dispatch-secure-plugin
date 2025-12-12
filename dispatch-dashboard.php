@@ -1,21 +1,13 @@
 <?php
 /**
- * Plugin Name: Dispatch SECURE v2.9.79
+ * Plugin Name: Dispatch SECURE v2.9.85
  * Plugin URI: https://your-domain.de
- * Description: SMS/Email notification fix - suppression bug resolved
- * Version: 2.9.79
+ * Description: Auto KM/ETA Berechnung bei Order-Updates (Fix maybeCalculateDistanceForOrder)
+ * Version: 2.9.85
  * Author: Ihr Name
  * License: GPL v2 or later
  * Requires PHP: 8.3
  * Requires at least: 6.0
- *
- * SMS/EMAIL NOTIFICATION FIX v2.9.79 (2025-12-09):
- * - FIXED: SMS/Email notifications were blocked by suppression flag when order marked as "geladen"
- * - FIXED: Suppression flag now temporarily deleted before sending intended notification
- * - FIXED: Suppression flag re-set after notification to prevent duplicates from other hooks
- * - ADDED: Order notes now record SMS sent/failed/skipped status for tracking
- * - ADDED: Order notes now record when "Fahrer unterwegs" email was triggered
- * - RESULT: Customers now receive SMS and Email when driver marks order as loaded
  *
  * METADATA SYNC FIX v2.9.74 (2025-11-19):
  * - FIXED: ajaxUpdateOrderStatus now cleans up metadata when "geladen" status is removed
@@ -28,6 +20,40 @@
  * - FIXED: ajaxGetDriverLocation used wrong meta key 'started_at' instead of '_delivery_started_at'
  * - RESULT: Tracking page now correctly shows customer address marker and route
  * - RESULT: ETA calculation now accurate (uses real OSRM routing data)
+ *
+ * TRACCAR DEVICE ID FIX v2.9.82 (2025-11-26):
+ * - FIXED: Inconsistent meta key usage (_traccar_device_id vs traccar_device_id)
+ * - FIXED: QR generator uses _traccar_device_id, other code used traccar_device_id
+ * - CHANGED: All code now checks BOTH meta keys with fallback for compatibility
+ * - CHANGED: Device creation now saves to BOTH keys to prevent future issues
+ * - RESULT: Customer tracking page now shows correct live driver position
+ *
+ * GEOCODING SYSTEM v2.9.81 (2025-11-26):
+ * - NEW: Hybrid geocoding system (Plus Code → Google Maps → Nominatim fallback)
+ * - NEW: Plus Code decoding for addresses without street names (perfect for Mallorca!)
+ * - NEW: extractPlusCodeFromOrder() searches multiple fields for Plus Codes
+ * - NEW: decodePlusCodeToCoordinates() uses OpenLocationCode library
+ * - NEW: Force geocoding option to override existing coordinates
+ * - IMPROVED: HPOS-compatible coordinate saving
+ * - IMPROVED: Rate limiting for Nominatim API (1 req/sec)
+ *
+ * TRACKING LINK FIX v2.9.80 (2025-11-26):
+ * - FIXED: Customer tracking links now accept both _tracking_token AND order_key
+ * - FIXED: "Ungültiger Tracking-Code" error when using SMS tracking links
+ *
+ * COMPLETE SMS SYSTEM FIX v2.9.78 (2025-11-26):
+ * - CRITICAL: Alle 3 SMS-Funktionen waren nicht implementiert! Jetzt vollständig:
+ * - ADDED: sendDeliveryStartedNotification() - SMS "Fahrer unterwegs" + Tracking-Link
+ * - ADDED: sendDeliveryStartedSMS() - Twilio SMS für "Fahrer unterwegs"
+ * - ADDED: sendDeliveredNotification() - SMS "Zugestellt" nach erfolgreicher Lieferung
+ * - ADDED: checkDriverNearbyNotifications() - SMS "In der Nähe" mit OSRM-ETA
+ * - ADDED: calculateRealisticETA() - Nutzt OSRM für realistische Fahrzeit-Berechnung
+ * - ADDED: sendDriverNearbySMS() - Sendet SMS mit ETA-Minuten
+ * - ADDED: sendSMSViaTwilio() - Twilio SMS API Integration
+ * - ADDED: formatPhoneNumberE164() - Telefonnummer-Formatierung (ES/DE/FR/UK)
+ * - ADDED: convertUmlautsForSMS() - GSM-7 Encoding für deutsche Umlaute
+ * - FIXED: dispatch_delivered_notification Hook jetzt registriert
+ * - FEATURE: Alle SMS mit Duplikat-Schutz und Order Notes
  *
  * TRACKING MAP FIX v2.9.72 (2025-11-19):
  * - FIXED: Customer address marker now displays on tracking page (3-tier coordinate fallback)
@@ -336,6 +362,9 @@ if (!defined('ABSPATH')) {
 // Include PHP 8.3 compatibility fixes (MUST be loaded first!)
 require_once plugin_dir_path(__FILE__) . 'includes/php83-compatibility.php';
 
+// Load Traits for modular code organization
+require_once plugin_dir_path(__FILE__) . 'traits/autoload-traits.php';
+
 // Include Security class (CRITICAL - v2.6.0)
 require_once plugin_dir_path(__FILE__) . 'includes/class-dispatch-security.php';
 
@@ -583,7 +612,7 @@ if (file_exists(plugin_dir_path(__FILE__) . 'vendor/autoload.php')) {
 }
 
 // Plugin-Konstanten definieren
-define('DISPATCH_VERSION', '2.9.37');
+define('DISPATCH_VERSION', '2.9.77');
 define('DISPATCH_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('DISPATCH_PLUGIN_URL', plugin_dir_url(__FILE__));
 
@@ -601,6 +630,11 @@ require_once(__DIR__ . '/dispatch-pluscode-addon.php');
  * Hauptklasse für das Dispatch Dashboard Plugin
  */
 class DispatchDashboard {
+    // Use Traits for modular code organization
+    use DispatchMessaging;
+    use DispatchDriverCore;
+    use DispatchOrderManagement;
+
 
     use Dispatch_PlusCode_Addon;
 
@@ -759,6 +793,7 @@ class DispatchDashboard {
         add_action('wp_ajax_dispatch_update_driver_status', [$this, 'ajaxUpdateDriverStatus']);
         add_action('wp_ajax_dispatch_geocode_orders', [$this, 'ajaxGeocodeOrders']);
         add_action('wp_ajax_dispatch_geocode_single_order', [$this, 'ajaxGeocodeSingleOrder']);
+        add_action('wp_ajax_dispatch_geocode_selected_orders', [$this, 'ajaxGeocodeOrdersWithDuplicateCheck']);
         add_action('wp_ajax_dispatch_reset_driver_password', [$this, 'ajaxResetDriverPassword']);
         add_action('wp_ajax_dispatch_get_driver_details', [$this, 'ajaxGetDriverDetails']);
         // REMOVED: Duplicate registration - use ajaxMarkAsDelivered instead (line 653)
@@ -849,12 +884,6 @@ class DispatchDashboard {
         add_action('wp_ajax_get_driver_packlist', [$this, 'ajaxGetDriverPacklist']);
         add_action('wp_ajax_get_product_image', [$this, 'ajaxGetProductImage']);
         add_action('wp_ajax_toggle_driver_online_status', [$this, 'ajaxToggleDriverOnlineStatus']);
-
-        // SumUp Tap to Pay AJAX Actions
-        add_action('wp_ajax_get_sumup_credentials', [$this, 'ajaxGetSumUpCredentials']);
-        add_action('wp_ajax_mark_sumup_payment', [$this, 'ajaxMarkSumUpPayment']);
-        add_action('wp_ajax_get_driver_sumup_key', [$this, 'ajaxGetDriverSumUpKey']);
-        add_action('wp_ajax_save_driver_sumup_key', [$this, 'ajaxSaveDriverSumUpKey']);
 
         // Mobile-specific toggle for Flutter app (no nonce required)
         add_action('wp_ajax_mobile_toggle_driver_status', [$this, 'ajaxMobileToggleDriverStatus']);
@@ -1042,6 +1071,9 @@ class DispatchDashboard {
 
         // Customer notifications when delivery starts
         add_action('dispatch_delivery_started_notification', [$this, 'sendDeliveryStartedNotification'], 10, 2);
+
+        // Customer notifications when delivery is completed
+        add_action('dispatch_delivered_notification', [$this, 'sendDeliveredNotification'], 10, 2);
 
         // Mobile Fahrer-App Routen
         add_action('init', [$this, 'addDriverAppRoutes']);
@@ -1342,18 +1374,6 @@ class DispatchDashboard {
         flush_rewrite_rules();
     }
     
-    /**
-     * Initialize online status for all existing drivers
-     */
-    private function initializeDriverOnlineStatus(): void {
-        $drivers = get_users(['role' => 'lieferfahrer']);
-        
-        foreach ($drivers as $driver) {
-            if (!get_user_meta($driver->ID, 'driver_online_status', true)) {
-                update_user_meta($driver->ID, 'driver_online_status', 'offline');
-            }
-        }
-    }
     
     /**
      * Plugin deaktivieren
@@ -1380,62 +1400,7 @@ class DispatchDashboard {
         return $schedules;
     }
     
-    /**
-     * Alte Fahrer-Rollen bereinigen
-     */
-    private function cleanupOldDriverRoles(): void {
-        // Entferne alte englische "driver" Rolle falls sie existiert
-        $old_driver_role = get_role('driver');
-        if ($old_driver_role) {
-            // Alle Benutzer mit der alten Rolle finden
-            $users_with_old_role = get_users(['role' => 'driver']);
-            
-            foreach ($users_with_old_role as $user) {
-                // Entferne die alte Rolle
-                $user->remove_role('driver');
-                // Füge die neue Rolle hinzu
-                $user->add_role('lieferfahrer');
-            }
-            
-            // Entferne die alte Rolle
-            remove_role('driver');
-        }
-        
-        // Entferne auch andere mögliche alte Rollen
-        $old_roles = ['delivery_driver', 'courier', 'shipper'];
-        foreach ($old_roles as $role) {
-            $old_role = get_role($role);
-            if ($old_role) {
-                remove_role($role);
-            }
-        }
-    }
     
-    /**
-     * Benutzerrolle "Lieferfahrer" erstellen
-     */
-    private function createDriverRole(): void {
-        // Entferne die Rolle falls sie existiert und erstelle sie neu
-        if (get_role('lieferfahrer')) {
-            remove_role('lieferfahrer');
-        }
-        
-        // Erstelle die Rolle neu
-        add_role('lieferfahrer', 'Lieferfahrer', [
-            'read' => true,
-            'edit_posts' => false,
-            'delete_posts' => false,
-            'upload_files' => true,
-            'dispatch_view_orders' => true,
-            'dispatch_update_status' => true,
-            'dispatch_view_dashboard' => true
-        ]);
-        
-        // Verifikation, dass die Rolle erstellt wurde
-        if (!get_role('lieferfahrer')) {
-            // Role creation failed - could add proper error handling here if needed
-        }
-    }
     
     /**
      * Datenbanktabellen erstellen
@@ -2229,178 +2194,7 @@ class DispatchDashboard {
         <?php
     }
 
-    /**
-     * Alle Lieferfahrer aus WordPress-Benutzern abrufen
-     */
-    private function getDriversFromUsers(): array {
-        // Prüfe ob die Rolle existiert
-        $driver_role = get_role('lieferfahrer');
-
-        if (!$driver_role) {
-            return [];
-        }
-
-        // Benutzer mit der Rolle 'lieferfahrer' abrufen (begrenzt für Speicher)
-        $drivers = get_users([
-            'role' => 'lieferfahrer',
-            'orderby' => 'display_name',
-            'order' => 'ASC',
-            'number' => 100 // Begrenze auf 100 Benutzer
-        ]);
-
-        // Get all Traccar devices once to check online status
-        $traccar_devices = [];
-        $traccar_enabled = get_option('dispatch_traccar_enabled', 0);
-        $traccar_url = get_option('dispatch_traccar_api_url', '');
-        $auth_headers = $this->getTraccarAuthHeaders();
-
-        if ($traccar_enabled && !empty($traccar_url) && !empty($auth_headers)) {
-            $devices_url = rtrim($traccar_url, '/') . '/api/devices';
-            $devices_response = wp_remote_get($devices_url, [
-                'headers' => $auth_headers,
-                'timeout' => 10
-            ]);
-
-            if (!is_wp_error($devices_response) && wp_remote_retrieve_response_code($devices_response) === 200) {
-                $devices = json_decode(wp_remote_retrieve_body($devices_response), true);
-                // Map devices by ID for quick lookup
-                foreach ($devices as $device) {
-                    $traccar_devices[$device['id']] = $device;
-                }
-            }
-        }
-
-        $driver_data = [];
-        foreach ($drivers as $driver) {
-            // Get Traccar status from live API
-            $traccar_device_id = get_user_meta($driver->ID, 'traccar_device_id', true);
-            $traccar_status = 'offline'; // Default
-
-            if ($traccar_device_id && isset($traccar_devices[$traccar_device_id])) {
-                // Check device status from Traccar
-                $device = $traccar_devices[$traccar_device_id];
-                $device_status = $device['status'] ?? 'unknown';
-
-                // Map Traccar status to our status
-                // Traccar statuses: online, offline, unknown
-                if ($device_status === 'online') {
-                    $traccar_status = 'online';
-                } else if ($device_status === 'offline' || $device_status === 'unknown') {
-                    // Also check lastUpdate timestamp as fallback
-                    if (isset($device['lastUpdate'])) {
-                        $last_update = strtotime($device['lastUpdate']);
-                        $age = time() - $last_update;
-                        // Consider online if updated in last 5 minutes
-                        if ($age < 300) {
-                            $traccar_status = 'online';
-                        }
-                    }
-                }
-            }
-
-            // Construct full name from first_name and last_name with fallback to display_name
-            $first_name = get_user_meta($driver->ID, 'first_name', true);
-            $last_name = get_user_meta($driver->ID, 'last_name', true);
-
-            // Priority: first_name + last_name > display_name > user_login
-            if (!empty($first_name) && !empty($last_name)) {
-                $full_name = trim($first_name . ' ' . $last_name);
-            } else if (!empty($first_name)) {
-                $full_name = $first_name;
-            } else if (!empty($last_name)) {
-                $full_name = $last_name;
-            } else if (!empty($driver->display_name)) {
-                $full_name = $driver->display_name;
-            } else {
-                $full_name = $driver->user_login; // Last resort
-            }
-
-            $driver_data[] = (object) [
-                'id' => $driver->ID,
-                'name' => $full_name,
-                'phone' => get_user_meta($driver->ID, 'driver_phone', true) ?: '-',
-                'email' => $driver->user_email,
-                'vehicle_type' => get_user_meta($driver->ID, 'driver_vehicle_type', true) ?: 'car',
-                'status' => $traccar_status,
-                'rating' => floatval(get_user_meta($driver->ID, 'driver_rating', true)) ?: 0.0,
-                'notes' => get_user_meta($driver->ID, 'driver_notes', true) ?: ''
-            ];
-        }
-        
-        return $driver_data;
-    }
     
-    /**
-     * PERFORMANCE OPTIMIERT: Fahrer mit Caching und nur Namen/IDs
-     */
-    public function getDriversFromUsersOptimized(): array {
-        // PERFORMANCE WIE PFAND-PLUGIN: Sichere Query mit Limits
-        try {
-            $start_time = microtime(true);
-            
-            // Cache für 5 Minuten
-            $cache_key = 'dispatch_drivers_optimized';
-            $cached_data = get_transient($cache_key);
-            
-            if ($cached_data !== false) {
-                return $cached_data;
-            }
-            
-            // Prüfe ob die Rolle existiert
-            $driver_role = get_role('lieferfahrer');
-            if (!$driver_role) {
-                return [];
-            }
-            
-            // PFAND-PLUGIN METHODE: Sichere Query mit Timeout-Schutz
-            $drivers = get_users([
-                'role' => 'lieferfahrer',
-                'orderby' => 'display_name',
-                'order' => 'ASC',
-                'number' => 15, // Wie Pfand-Plugin: 15 Items
-                'fields' => ['ID', 'display_name'],
-                'meta_query' => []
-            ]);
-            
-            $driver_data = [];
-            foreach ($drivers as $driver) {
-                // Construct full name from first_name and last_name with fallback to display_name
-                $first_name = get_user_meta($driver->ID, 'first_name', true);
-                $last_name = get_user_meta($driver->ID, 'last_name', true);
-
-                // Priority: first_name + last_name > display_name > user_login
-                if (!empty($first_name) && !empty($last_name)) {
-                    $full_name = trim($first_name . ' ' . $last_name);
-                } else if (!empty($first_name)) {
-                    $full_name = $first_name;
-                } else if (!empty($last_name)) {
-                    $full_name = $last_name;
-                } else if (!empty($driver->display_name)) {
-                    $full_name = $driver->display_name;
-                } else {
-                    // Fallback: Get user_login if display_name is empty
-                    $user = get_userdata($driver->ID);
-                    $full_name = $user ? $user->user_login : "Fahrer #{$driver->ID}";
-                }
-
-                $driver_data[] = (object) [
-                    'id' => $driver->ID,
-                    'name' => $full_name,
-                    'order_count' => 0 // Wird per AJAX geladen
-                ];
-            }
-            
-            // Cache für 5 Minuten setzen
-            set_transient($cache_key, $driver_data, 5 * MINUTE_IN_SECONDS);
-            
-            $execution_time = microtime(true) - $start_time;
-            
-            return $driver_data;
-            
-        } catch (Exception $e) {
-            return [];
-        }
-    }
     
     /**
      * PERFORMANCE OPTIMIERT: Unzugewiesene Aufträge mit Caching
@@ -2541,14 +2335,15 @@ class DispatchDashboard {
             [$this, 'renderPfandverwaltungPage']
         );
         
-        add_submenu_page(
-            'dispatch-dashboard',
-            'Einkaufsliste',
-            'Einkaufsliste',
-            'manage_woocommerce',
-            'dispatch-einkaufsliste',
-            [$this, 'renderEinkaufslistePage']
-        );
+        // REMOVED: Einkaufsliste menu - no longer needed
+        // add_submenu_page(
+        //     'dispatch-dashboard',
+        //     'Einkaufsliste',
+        //     'Einkaufsliste',
+        //     'manage_woocommerce',
+        //     'dispatch-einkaufsliste',
+        //     [$this, 'renderEinkaufslistePage']
+        // );
 
         add_submenu_page(
             'dispatch-dashboard',
@@ -3176,10 +2971,15 @@ class DispatchDashboard {
                             }
                             // Try different date parsing methods
                             else if (dateText.includes('.')) {
-                                // German format: 23.09.2025
+                                // German format: 23.09.2025 or 23.09.25
                                 const parts = dateText.split('.');
                                 if (parts.length === 3) {
-                                    deliveryDate = new Date(parseInt(parts[2]), parseInt(parts[1]) - 1, parseInt(parts[0]));
+                                    let year = parseInt(parts[2]);
+                                    // Handle 2-digit year (e.g., "25" -> 2025)
+                                    if (year < 100) {
+                                        year = 2000 + year;
+                                    }
+                                    deliveryDate = new Date(year, parseInt(parts[1]) - 1, parseInt(parts[0]));
                                 }
                             } else if (dateText.includes(',')) {
                                 // Format: September 23, 2025 or 23 September, 2025
@@ -3778,193 +3578,9 @@ class DispatchDashboard {
         return $orders;
     }
     
-    /**
-     * Filter orders by delivery date
-     */
-    private function filterOrdersByDate($orders, $type = 'future') {
-        $today = new DateTime('today', wp_timezone());
-        $filtered_orders = [];
-        
-        
-        foreach ($orders as $order) {
-            $delivery_date_str = $order->get_meta('Gewünschtes Lieferdatum');
-            
-            if (empty($delivery_date_str)) {
-                // Aufträge ohne Lieferdatum: für 'future' einschließen (geplante Aufträge)
-                if ($type === 'future') {
-                    $filtered_orders[] = $order;
-                }
-                continue;
-            }
-            
-            $delivery_date = $this->parseDeliveryDate($delivery_date_str);
-            if (!$delivery_date) {
-                // Unparseable Daten: auch für 'future' einschließen
-                if ($type === 'future') {
-                    $filtered_orders[] = $order;
-                }
-                continue;
-            }
-            
-            // Comparison: for future, date must be AFTER today (not equal)
-            $is_today = $delivery_date->format('Y-m-d') === $today->format('Y-m-d');
-            $is_future = $delivery_date->format('Y-m-d') > $today->format('Y-m-d');
-            
-            if ($type === 'future' && $is_future) {
-                $filtered_orders[] = $order;
-            } elseif ($type === 'today' && $is_today) {
-                $filtered_orders[] = $order;
-            }
-        }
-        
-        return $filtered_orders;
-    }
     
-    /**
-     * Parse delivery date from various formats
-     */
-    private function parseDeliveryDate($date_str) {
-        // Debug logging für unbekannte Formate
-        static $logged_formats = [];
 
-        // Clean up the date string (remove extra spaces, etc.)
-        $date_str = trim($date_str);
 
-        // Zuerst prüfen ob es ein deutsches Format mit Monatsnamen ist
-        // Format: "1. Oktober, 2025" oder "1 Oktober, 2025" oder "30. September, 2025"
-        if (preg_match('/(\d{1,2})\.?\s+(Januar|Februar|März|April|Mai|Juni|Juli|August|September|Oktober|November|Dezember),?\s+(\d{4})/i', $date_str, $matches)) {
-            $german_months = [
-                'januar' => 1, 'februar' => 2, 'märz' => 3, 'april' => 4,
-                'mai' => 5, 'juni' => 6, 'juli' => 7, 'august' => 8,
-                'september' => 9, 'oktober' => 10, 'november' => 11, 'dezember' => 12
-            ];
-            $day = (int)$matches[1];
-            $month = $german_months[strtolower($matches[2])];
-            $year = (int)$matches[3];
-
-            $date = DateTime::createFromFormat('Y-m-d', sprintf('%04d-%02d-%02d', $year, $month, $day));
-            if ($date !== false) {
-                $date->setTime(0, 0, 0);
-                return $date;
-            }
-        }
-
-        // IMPORTANT: Two-digit year formats MUST come BEFORE four-digit year formats
-        // Otherwise 'd.m.Y' will match '27.10.25' and interpret '25' as year 0025!
-        $formats = [
-            'd.m.y',           // 03.09.25 (two-digit year - CHECK FIRST!)
-            'd/m/y',           // 03/09/25 (two-digit year)
-            'd-m-y',           // 03-09-25 (two-digit year)
-            'm/d/y',           // 09/03/25 (two-digit year)
-            'y/m/d',           // 25/09/03 (two-digit year)
-            'Y-m-d',           // 2025-09-03
-            'd.m.Y',           // 03.09.2025
-            'j F, Y',          // 3 September, 2025
-            'j F Y',           // 3 September 2025 (ohne Komma)
-            'F j, Y',          // September 3, 2025
-            'd/m/Y',           // 03/09/2025
-            'm/d/Y',           // 09/03/2025
-            'd-m-Y',           // 03-09-2025 (Order Delivery Date Plugin format)
-            'j M, Y',          // 3 Sep, 2025
-            'd M, Y',          // 03 Sep, 2025
-            'M j, Y',          // Sep 3, 2025
-            'Y/m/d',           // 2025/09/03
-        ];
-
-        foreach ($formats as $format) {
-            $date = DateTime::createFromFormat($format, $date_str);
-            if ($date !== false) {
-                // Reset time to midnight for consistent date comparisons
-                $date->setTime(0, 0, 0);
-                return $date;
-            }
-        }
-
-        // Special handling for German month names
-        $german_months = [
-            'Januar' => 'January', 'Februar' => 'February', 'März' => 'March',
-            'April' => 'April', 'Mai' => 'May', 'Juni' => 'June',
-            'Juli' => 'July', 'August' => 'August', 'September' => 'September',
-            'Oktober' => 'October', 'November' => 'November', 'Dezember' => 'December'
-        ];
-
-        $date_str_en = str_replace(array_keys($german_months), array_values($german_months), (string)$date_str);
-
-        if ($date_str_en !== $date_str) {
-            // Try parsing with English month names
-            foreach ($formats as $format) {
-                $date = DateTime::createFromFormat($format, $date_str_en);
-                if ($date !== false) {
-                    $date->setTime(0, 0, 0);
-                    return $date;
-                }
-            }
-        }
-
-        // Fallback: Try to parse with strtotime
-        $timestamp = strtotime($date_str);
-        if ($timestamp !== false && $timestamp > 0) {
-            $date = new DateTime('@' . $timestamp);
-            $date->setTimezone(wp_timezone());
-            $date->setTime(0, 0, 0);
-            return $date;
-        }
-
-        // Log unrecognized format once
-        if (!empty($date_str) && !isset($logged_formats[$date_str])) {
-            error_log("Dispatch Dashboard: Unable to parse delivery date format: '$date_str'");
-            $logged_formats[$date_str] = true;
-        }
-
-        return false;
-    }
-
-    /**
-     * Format distance with unit and duration for display
-     */
-    private function formatDistance($order) {
-        $distance = $order->get_meta('lpac_customer_distance');
-        $distance_unit = $order->get_meta('lpac_customer_distance_unit') ?: 'km';
-        $distance_duration = $order->get_meta('lpac_customer_distance_duration');
-
-        if (!$distance) {
-            return '';
-        }
-
-        $formatted = round(floatval($distance), 1) . ' ' . $distance_unit;
-
-        if ($distance_duration) {
-            $formatted .= ' (' . $distance_duration . ')';
-        }
-
-        return $formatted;
-    }
-
-    /**
-     * Normalize delivery time descriptions for space saving
-     * Converts long phrases to abbreviated forms:
-     * - "schnellstmöglich", "asap", "so schnell wie möglich" → "swm"
-     * - "nach Vereinbarung", "nach Absprache" → "na"
-     */
-    private function normalizeDeliveryTime($time_slot): string {
-        if (empty($time_slot)) {
-            return '';
-        }
-
-        $time_slot_lower = strtolower(trim($time_slot));
-
-        // Convert "as soon as possible" variants to "swm"
-        if (in_array($time_slot_lower, ['schnellstmöglich', 'so schnell wie möglich', 'asap'])) {
-            return 'swm';
-        }
-
-        // Convert "by arrangement" variants to "na"
-        if (in_array($time_slot_lower, ['nach vereinbarung', 'nach absprache'])) {
-            return 'na';
-        }
-
-        return $time_slot;
-    }
 
     /**
      * Filter order IDs by date (optimierte Version für Performance)
@@ -5163,31 +4779,6 @@ class DispatchDashboard {
         return count($orders);
     }
     
-    /**
-     * Hole Anzahl der Aufträge für einen bestimmten Fahrer (heute)
-     */
-    private function getDriverOrderCount($driver_id): int {
-        if (!$driver_id) {
-            return 0;
-        }
-
-        // Count ACTIVE orders assigned to this driver (not by creation date, but by assignment status)
-        // Active means: not completed, not cancelled, not failed
-        $args = [
-            'limit' => -1,
-            'status' => ['processing', 'on-hold', 'pending'], // Active orders only
-            'meta_query' => [
-                [
-                    'key' => '_assigned_driver',
-                    'value' => $driver_id,
-                    'compare' => '='
-                ]
-            ]
-        ];
-
-        $orders = $this->getOrders($args);
-        return count($orders);
-    }
 
     /**
      * AJAX: Get ready status for multiple orders
@@ -5199,14 +4790,15 @@ class DispatchDashboard {
         $driver_id = get_current_user_id();
 
         // Zeitstempel für verschiedene Perioden
-        $today_start = strtotime('today 00:00:00');
-        $week_start = strtotime('monday this week 00:00:00');
-        $month_start = strtotime('first day of this month 00:00:00');
+        $today_date = date('Y-m-d');
+        $week_start_date = date('Y-m-d', strtotime('monday this week'));
+        $month_start_date = date('Y-m-d', strtotime('first day of this month'));
 
-        // Basis-Query für zugestellte Bestellungen
+        // Get ALL completed/delivered orders for this driver
+        // Fixed 2025-11-27: Include 'delivered' status
         $base_args = [
             'limit' => -1,
-            'status' => ['wc-completed'],
+            'status' => ['completed', 'delivered'],
             'meta_query' => [
                 [
                     'key' => '_assigned_driver',
@@ -5216,29 +4808,52 @@ class DispatchDashboard {
             ]
         ];
 
-        // HEUTE: Anzahl Lieferungen
-        $today_args = array_merge($base_args, [
-            'date_completed' => '>=' . $today_start,
-        ]);
-        $today_orders = wc_get_orders($today_args);
-        $today_count = count($today_orders);
-
-        // WOCHE: Anzahl Lieferungen
-        $week_args = array_merge($base_args, [
-            'date_completed' => '>=' . $week_start,
-        ]);
-        $week_orders = wc_get_orders($week_args);
-        $week_count = count($week_orders);
-
-        // MONAT: Anzahl Lieferungen
-        $month_args = array_merge($base_args, [
-            'date_completed' => '>=' . $month_start,
-        ]);
-        $month_orders = wc_get_orders($month_args);
-        $month_count = count($month_orders);
-
-        // GESAMT: Alle Lieferungen
         $all_orders = wc_get_orders($base_args);
+
+        // Helper function to get completion date for an order
+        $getCompletionDate = function($order) {
+            // First check WooCommerce's date_completed
+            $date_completed = $order->get_date_completed();
+            if ($date_completed) {
+                return $date_completed->format('Y-m-d');
+            }
+            // Fallback for 'delivered' status: use date_modified
+            if ($order->get_status() === 'delivered') {
+                $date_modified = $order->get_date_modified();
+                if ($date_modified) {
+                    return $date_modified->format('Y-m-d');
+                }
+            }
+            return null;
+        };
+
+        // Count orders for each period
+        $today_count = 0;
+        $week_count = 0;
+        $month_count = 0;
+        $today_orders = [];
+
+        foreach ($all_orders as $order) {
+            $completion_date = $getCompletionDate($order);
+            if (!$completion_date) continue;
+
+            // Today
+            if ($completion_date === $today_date) {
+                $today_count++;
+                $today_orders[] = $order;
+            }
+
+            // This week
+            if ($completion_date >= $week_start_date) {
+                $week_count++;
+            }
+
+            // This month
+            if ($completion_date >= $month_start_date) {
+                $month_count++;
+            }
+        }
+
         $total_count = count($all_orders);
 
         // BEWERTUNGEN: Aus User Meta (bereits vorberechnet)
@@ -5247,16 +4862,33 @@ class DispatchDashboard {
         $stars_5 = intval(get_user_meta($driver_id, 'driver_rating_stars_5', true));
 
         // PERFORMANCE: Durchschnittliche Lieferzeit (nur heute für Performance)
+        // Fixed 2025-11-27: Use _delivery_completed_date or date_modified for delivered orders
         $total_duration = 0;
         $deliveries_with_time = 0;
 
         foreach ($today_orders as $order) {
             $ready_time = $order->get_meta('_order_ready_timestamp');
-            $delivered_time = $order->get_date_completed();
 
-            if ($ready_time && $delivered_time) {
+            // Get delivered time - try multiple sources
+            $delivered_timestamp = null;
+            $date_completed = $order->get_date_completed();
+            if ($date_completed) {
+                $delivered_timestamp = $date_completed->getTimestamp();
+            } else {
+                // Fallback for delivered orders
+                $delivery_completed_date = $order->get_meta('_delivery_completed_date');
+                if ($delivery_completed_date) {
+                    $delivered_timestamp = strtotime($delivery_completed_date);
+                } else {
+                    $date_modified = $order->get_date_modified();
+                    if ($date_modified) {
+                        $delivered_timestamp = $date_modified->getTimestamp();
+                    }
+                }
+            }
+
+            if ($ready_time && $delivered_timestamp) {
                 $ready_timestamp = strtotime($ready_time);
-                $delivered_timestamp = $delivered_time->getTimestamp();
                 $duration = ($delivered_timestamp - $ready_timestamp) / 60; // in Minuten
 
                 if ($duration > 0 && $duration < 300) { // Nur sinnvolle Werte (< 5 Stunden)
@@ -5274,11 +4906,26 @@ class DispatchDashboard {
         $fastest_delivery = 0;
         foreach ($today_orders as $order) {
             $ready_time = $order->get_meta('_order_ready_timestamp');
-            $delivered_time = $order->get_date_completed();
 
-            if ($ready_time && $delivered_time) {
+            // Get delivered time - try multiple sources
+            $delivered_timestamp = null;
+            $date_completed = $order->get_date_completed();
+            if ($date_completed) {
+                $delivered_timestamp = $date_completed->getTimestamp();
+            } else {
+                $delivery_completed_date = $order->get_meta('_delivery_completed_date');
+                if ($delivery_completed_date) {
+                    $delivered_timestamp = strtotime($delivery_completed_date);
+                } else {
+                    $date_modified = $order->get_date_modified();
+                    if ($date_modified) {
+                        $delivered_timestamp = $date_modified->getTimestamp();
+                    }
+                }
+            }
+
+            if ($ready_time && $delivered_timestamp) {
                 $ready_timestamp = strtotime($ready_time);
-                $delivered_timestamp = $delivered_time->getTimestamp();
                 $duration = ($delivered_timestamp - $ready_timestamp) / 60;
 
                 if ($duration > 0 && $duration < 300) {
@@ -5652,54 +5299,51 @@ class DispatchDashboard {
         Dispatch_Security::verify_driver_access(true);
 
         $customer_email = sanitize_email($_POST['customer_email'] ?? '');
-        $customer_phone = sanitize_text_field($_POST['customer_phone'] ?? '');
         $exclude_order_id = intval($_POST['exclude_order_id'] ?? 0);
         $include_current = ($_POST['include_current'] ?? 'false') === 'true';
 
-        // If no email/phone provided, try to get them from the order
-        $plus_code = '';
-        if ((empty($customer_email) || empty($customer_phone)) && $exclude_order_id > 0) {
+        // If no email provided, try to get it from the order
+        if (empty($customer_email) && $exclude_order_id > 0) {
             $order = wc_get_order($exclude_order_id);
             if ($order) {
-                if (empty($customer_email)) {
-                    $customer_email = $order->get_billing_email();
-                }
-                if (empty($customer_phone)) {
-                    $customer_phone = $order->get_billing_phone();
-                }
-                // Get Plus Code from order (try multiple meta keys)
-                $plus_code = $order->get_meta('_billing_plus_code');
-                if (empty($plus_code)) {
-                    $plus_code = $order->get_meta('plus_code');
-                }
-                if (empty($plus_code)) {
-                    $plus_code = $order->get_meta('lpac_plus_code');
-                }
+                $customer_email = $order->get_billing_email();
             }
         }
 
-        // Normalize phone number for comparison (remove spaces, dashes, leading zeros/+)
-        $normalized_phone = $this->normalizePhoneNumber($customer_phone);
-
-        // Validate - we need at least email OR phone OR plus code
-        if ((empty($customer_email) || !is_email($customer_email)) && empty($normalized_phone) && empty($plus_code)) {
-            error_log('Pfand History - No valid email, phone or plus code: ' . $customer_email . ' / ' . $customer_phone);
+        // Validate email
+        if (empty($customer_email) || !is_email($customer_email)) {
+            error_log('Pfand History - Invalid or empty email: ' . $customer_email);
+            // Return empty history instead of error for driver app
             wp_send_json_success([
                 'history' => [],
                 'order_total' => 0,
                 'is_demo' => false,
-                'debug' => 'No valid email, phone or plus code'
+                'debug' => 'Invalid email: ' . $customer_email
             ]);
             return;
         }
-
+        
         // Get the configured start date for Pfand system
         $pfand_start_date = get_option('dispatch_pfand_start_date', '');
 
-        // COMBINED SEARCH: Find orders by EMAIL, PHONE or PLUS CODE
-        // This solves the problem where customers order with different email addresses
-        // Plus Code identifies the delivery location (same address = same customer)
-        $orders = $this->findOrdersByEmailPhoneOrPlusCode($customer_email, $normalized_phone, $plus_code, $pfand_start_date);
+        // Build query args with date filter if configured
+        $query_args = [
+            'customer' => $customer_email,
+            'limit' => -1,
+            'status' => ['processing', 'completed', 'on-hold'],
+            'orderby' => 'date',
+            'order' => 'DESC',
+            'return' => 'objects'
+        ];
+
+        // Add date filter if configured
+        if (!empty($pfand_start_date)) {
+            $query_args['date_created'] = '>=' . strtotime($pfand_start_date);
+        }
+
+        // Suche nach Bestellungen des Kunden mit Pfand
+        // WICHTIG: Verwende 'customer' statt 'billing_email' - wie im funktionierenden Plugin
+        $orders = wc_get_orders($query_args);
 
         $pfand_history = [];
         $order_total = 0;
@@ -5749,216 +5393,7 @@ class DispatchDashboard {
             'order_total' => $order_total
         ]);
     }
-
-    /**
-     * Normalize phone number for comparison
-     * Removes spaces, dashes, parentheses, and normalizes country codes
-     */
-    private function normalizePhoneNumber(string $phone): string {
-        if (empty($phone)) {
-            return '';
-        }
-
-        // Remove all non-numeric characters except +
-        $phone = preg_replace('/[^0-9+]/', '', $phone);
-
-        // Remove leading + and replace with 00
-        if (strpos($phone, '+') === 0) {
-            $phone = '00' . substr($phone, 1);
-        }
-
-        // Remove leading 00 for comparison (we'll compare just the core number)
-        if (strpos($phone, '00') === 0) {
-            $phone = substr($phone, 2);
-        }
-
-        // Remove leading 0 for local numbers
-        if (strpos($phone, '0') === 0 && strlen($phone) > 1) {
-            $phone = substr($phone, 1);
-        }
-
-        // Return last 9 digits for comparison (handles different country code formats)
-        if (strlen($phone) > 9) {
-            return substr($phone, -9);
-        }
-
-        return $phone;
-    }
-
-    /**
-     * Find orders by email, phone number OR Plus Code
-     * This allows matching customers who use different email addresses
-     * Plus Code identifies the delivery location (same address = same customer)
-     * Supports both legacy (posts/postmeta) and HPOS (wc_orders) storage
-     */
-    private function findOrdersByEmailPhoneOrPlusCode(string $email, string $normalized_phone, string $plus_code = '', string $start_date = ''): array {
-        global $wpdb;
-
-        $orders = [];
-        $found_order_ids = [];
-
-        // Check if HPOS is enabled
-        $hpos_enabled = get_option('woocommerce_custom_orders_table_enabled') === 'yes';
-
-        // Status filter
-        $statuses = ['wc-processing', 'wc-completed', 'wc-on-hold'];
-
-        if ($hpos_enabled) {
-            // HPOS: Use wc_orders and wc_order_addresses tables
-            $date_filter = '';
-            if (!empty($start_date)) {
-                $date_filter = $wpdb->prepare(" AND o.date_created_gmt >= %s", $start_date);
-            }
-
-            // Search by EMAIL (HPOS)
-            if (!empty($email) && is_email($email)) {
-                $email_query = $wpdb->prepare(
-                    "SELECT DISTINCT o.id FROM {$wpdb->prefix}wc_orders o
-                     INNER JOIN {$wpdb->prefix}wc_order_addresses oa ON o.id = oa.order_id AND oa.address_type = 'billing'
-                     WHERE o.type = 'shop_order'
-                     AND o.status IN ('wc-processing', 'wc-completed', 'wc-on-hold')
-                     AND oa.email = %s
-                     $date_filter
-                     ORDER BY o.date_created_gmt DESC",
-                    $email
-                );
-
-                $email_results = $wpdb->get_col($email_query);
-                foreach ($email_results as $order_id) {
-                    $found_order_ids[$order_id] = true;
-                }
-            }
-
-            // Search by PHONE (HPOS)
-            if (!empty($normalized_phone)) {
-                $phone_query = "SELECT DISTINCT o.id, oa.phone FROM {$wpdb->prefix}wc_orders o
-                     INNER JOIN {$wpdb->prefix}wc_order_addresses oa ON o.id = oa.order_id AND oa.address_type = 'billing'
-                     WHERE o.type = 'shop_order'
-                     AND o.status IN ('wc-processing', 'wc-completed', 'wc-on-hold')
-                     AND oa.phone != ''
-                     $date_filter
-                     ORDER BY o.date_created_gmt DESC
-                     LIMIT 500";
-
-                $phone_results = $wpdb->get_results($phone_query);
-                foreach ($phone_results as $row) {
-                    $order_normalized = $this->normalizePhoneNumber($row->phone);
-                    if ($order_normalized === $normalized_phone) {
-                        $found_order_ids[$row->id] = true;
-                    }
-                }
-            }
-
-            // Search by PLUS CODE (HPOS)
-            if (!empty($plus_code)) {
-                // Search in wc_orders_meta for plus code (try multiple meta keys)
-                $plus_code_query = $wpdb->prepare(
-                    "SELECT DISTINCT o.id FROM {$wpdb->prefix}wc_orders o
-                     INNER JOIN {$wpdb->prefix}wc_orders_meta om ON o.id = om.order_id
-                     WHERE o.type = 'shop_order'
-                     AND o.status IN ('wc-processing', 'wc-completed', 'wc-on-hold')
-                     AND om.meta_key IN ('_billing_plus_code', 'plus_code', 'lpac_plus_code')
-                     AND om.meta_value = %s
-                     $date_filter
-                     ORDER BY o.date_created_gmt DESC",
-                    $plus_code
-                );
-
-                $plus_code_results = $wpdb->get_col($plus_code_query);
-                foreach ($plus_code_results as $order_id) {
-                    $found_order_ids[$order_id] = true;
-                }
-            }
-        } else {
-            // Legacy: Use posts/postmeta tables
-            $date_filter = '';
-            if (!empty($start_date)) {
-                $date_filter = $wpdb->prepare(" AND p.post_date >= %s", $start_date);
-            }
-
-            $status_placeholders = implode(',', array_fill(0, count($statuses), '%s'));
-
-            // Search by EMAIL (Legacy)
-            if (!empty($email) && is_email($email)) {
-                $email_query = $wpdb->prepare(
-                    "SELECT DISTINCT p.ID FROM {$wpdb->posts} p
-                     INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id
-                     WHERE p.post_type = 'shop_order'
-                     AND p.post_status IN ($status_placeholders)
-                     AND pm.meta_key = '_billing_email'
-                     AND pm.meta_value = %s
-                     $date_filter
-                     ORDER BY p.post_date DESC",
-                    array_merge($statuses, [$email])
-                );
-
-                $email_results = $wpdb->get_col($email_query);
-                foreach ($email_results as $order_id) {
-                    $found_order_ids[$order_id] = true;
-                }
-            }
-
-            // Search by PHONE (Legacy)
-            if (!empty($normalized_phone)) {
-                $phone_query = $wpdb->prepare(
-                    "SELECT DISTINCT p.ID, pm.meta_value as phone FROM {$wpdb->posts} p
-                     INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id
-                     WHERE p.post_type = 'shop_order'
-                     AND p.post_status IN ($status_placeholders)
-                     AND pm.meta_key = '_billing_phone'
-                     AND pm.meta_value != ''
-                     $date_filter
-                     ORDER BY p.post_date DESC
-                     LIMIT 500",
-                    $statuses
-                );
-
-                $phone_results = $wpdb->get_results($phone_query);
-                foreach ($phone_results as $row) {
-                    $order_normalized = $this->normalizePhoneNumber($row->phone);
-                    if ($order_normalized === $normalized_phone) {
-                        $found_order_ids[$row->ID] = true;
-                    }
-                }
-            }
-
-            // Search by PLUS CODE (Legacy)
-            if (!empty($plus_code)) {
-                $plus_code_query = $wpdb->prepare(
-                    "SELECT DISTINCT p.ID FROM {$wpdb->posts} p
-                     INNER JOIN {$wpdb->postmeta} pm ON p.ID = pm.post_id
-                     WHERE p.post_type = 'shop_order'
-                     AND p.post_status IN ($status_placeholders)
-                     AND pm.meta_key IN ('_billing_plus_code', 'plus_code', 'lpac_plus_code')
-                     AND pm.meta_value = %s
-                     $date_filter
-                     ORDER BY p.post_date DESC",
-                    array_merge($statuses, [$plus_code])
-                );
-
-                $plus_code_results = $wpdb->get_col($plus_code_query);
-                foreach ($plus_code_results as $order_id) {
-                    $found_order_ids[$order_id] = true;
-                }
-            }
-        }
-
-        // Convert to WC_Order objects
-        foreach (array_keys($found_order_ids) as $order_id) {
-            $order = wc_get_order($order_id);
-            if ($order) {
-                $orders[] = $order;
-            }
-        }
-
-        // Sort by date descending
-        usort($orders, function($a, $b) {
-            return $b->get_date_created()->getTimestamp() - $a->get_date_created()->getTimestamp();
-        });
-
-        return $orders;
-    }
-
+    
     /**
      * AJAX: Pfand zurückerstatten
      */
@@ -6004,24 +5439,11 @@ class DispatchDashboard {
             $total_credit += floatval($item['amount']);
         }
         
-        // Berechne Abzug für fehlende Flaschen - DYNAMISCH aus Einstellungen
-        $pfand_items_config = get_option('dispatch_pfand_items', [
-            ['id' => 'water', 'icon' => '🍼', 'name' => 'Wasserflasche', 'amount' => 0.50, 'active' => true],
-            ['id' => 'beer', 'icon' => '🍺', 'name' => 'Bierflasche', 'amount' => 0.25, 'active' => true]
-        ]);
-
-        // Erstelle Lookup-Array für Pfand-Preise nach ID und Name
-        $pfand_prices = [];
-        foreach ($pfand_items_config as $item) {
-            if (isset($item['active']) && !$item['active']) continue;
-            $pfand_prices[$item['id']] = floatval($item['amount']);
-            $pfand_prices[$item['name']] = floatval($item['amount']);
-        }
-
+        // Berechne Abzug für fehlende Flaschen
         foreach ($missing_bottles as $bottle_type => $quantity) {
             if ($quantity > 0) {
-                // Hole Preis aus Einstellungen, Fallback auf 0.25
-                $bottle_price = isset($pfand_prices[$bottle_type]) ? $pfand_prices[$bottle_type] : 0.25;
+                // Hier könnten die Pfand-Preise aus den Einstellungen geholt werden
+                $bottle_price = ($bottle_type === 'Wasserflasche') ? 0.25 : 0.50;
                 $total_deduction += $quantity * $bottle_price;
             }
         }
@@ -7956,8 +7378,11 @@ class DispatchDashboard {
                             $vehicle_icon = $driver->vehicle_type === 'truck' ? '🚚' : '🚗';
                             $status_text = $driver->status === 'online' ? 'Online' : 'Offline';
 
-                            // Get Traccar credentials
-                            $traccar_device_id = get_user_meta($driver->id, 'traccar_device_id', true);
+                            // Get Traccar credentials - check BOTH meta keys (v2.9.82)
+                            $traccar_device_id = get_user_meta($driver->id, '_traccar_device_id', true);
+                            if (empty($traccar_device_id)) {
+                                $traccar_device_id = get_user_meta($driver->id, 'traccar_device_id', true);
+                            }
                             $traccar_url = get_option('dispatch_traccar_api_url', 'http://91.98.17.58:8082');
                         ?>
                         <tr data-driver-id="<?php echo $driver->id; ?>">
@@ -9850,10 +9275,15 @@ class DispatchDashboard {
                         
                         let orderDeliveryDateString = '';
                         if (order.delivery_date.includes('.')) {
-                            // Convert DD.MM.YYYY to YYYY-MM-DD
+                            // Convert DD.MM.YYYY or DD.MM.YY to YYYY-MM-DD
                             const parts = order.delivery_date.split('.');
                             if (parts.length === 3) {
-                                orderDeliveryDateString = parts[2] + '-' + parts[1].padStart(2, '0') + '-' + parts[0].padStart(2, '0');
+                                let year = parts[2];
+                                // Handle 2-digit year (e.g., "25" -> "2025")
+                                if (year.length === 2) {
+                                    year = '20' + year;
+                                }
+                                orderDeliveryDateString = year + '-' + parts[1].padStart(2, '0') + '-' + parts[0].padStart(2, '0');
                             }
                         } else if (order.delivery_date.includes('-')) {
                             orderDeliveryDateString = order.delivery_date;
@@ -11075,17 +10505,13 @@ class DispatchDashboard {
             return;
         }
 
-        // Check if OSRM is enabled
+        // Check if OSRM is enabled (required for route calculation)
         if (!get_option('dispatch_osrm_enabled')) {
-            wp_send_json_error('OSRM ist nicht aktiviert');
+            wp_send_json_error('OSRM ist nicht aktiviert. Bitte in Einstellungen aktivieren.');
             return;
         }
 
-        // Check if Traccar is enabled
-        if (!get_option('dispatch_traccar_enabled')) {
-            wp_send_json_error('Traccar ist nicht aktiviert');
-            return;
-        }
+        // Note: Traccar is NOT required - we fallback to depot coordinates if no driver GPS
 
         $order = wc_get_order($order_id);
         if (!$order) {
@@ -11093,51 +10519,73 @@ class DispatchDashboard {
             return;
         }
 
-        // Get assigned driver
-        $driver_id = get_post_meta($order_id, '_assigned_driver', true);
-        if (!$driver_id) {
-            wp_send_json_error('Kein Fahrer zugewiesen');
-            return;
+        // Get start position: Driver (if assigned and has GPS) or Depot
+        $start_lat = null;
+        $start_lon = null;
+        $source = 'depot'; // Default: calculate from depot
+
+        $driver_id = $order->get_meta('_assigned_driver');
+        if ($driver_id) {
+            // Try to get driver position from Traccar
+            $driver_position = $this->getDriverPositionFromTraccar($driver_id);
+            if ($driver_position && !empty($driver_position['latitude'])) {
+                $start_lat = $driver_position['latitude'];
+                $start_lon = $driver_position['longitude'];
+                $source = 'driver';
+            }
         }
 
-        // Get driver position from Traccar
-        $driver_position = $this->getDriverPositionFromTraccar($driver_id);
-        if (!$driver_position) {
-            wp_send_json_error('Fahrer-Position nicht verfügbar (GPS-Tracking aktiv?)');
-            return;
+        // Fallback to depot coordinates if no driver position
+        if (empty($start_lat) || empty($start_lon)) {
+            $start_lat = floatval(get_option('dispatch_depot_latitude', 0));
+            $start_lon = floatval(get_option('dispatch_depot_longitude', 0));
+
+            if (empty($start_lat) || empty($start_lon)) {
+                wp_send_json_error('Depot-Koordinaten nicht konfiguriert');
+                return;
+            }
         }
 
-        // Get customer coordinates
-        $customer_lat = get_post_meta($order_id, '_shipping_latitude', true);
-        $customer_lon = get_post_meta($order_id, '_shipping_longitude', true);
+        // Get customer coordinates - check multiple meta keys (lpac first, then _shipping)
+        $customer_lat = $order->get_meta('lpac_latitude');
+        $customer_lon = $order->get_meta('lpac_longitude');
 
-        // If no coordinates stored, try to geocode address
+        // Fallback to _shipping_ meta keys
         if (empty($customer_lat) || empty($customer_lon)) {
-            // Try Plus Code first
-            $plus_code = get_post_meta($order_id, '_shipping_plus_code', true);
+            $customer_lat = $order->get_meta('_shipping_latitude');
+            $customer_lon = $order->get_meta('_shipping_longitude');
+        }
+
+        // If still no coordinates, try Plus Code
+        if (empty($customer_lat) || empty($customer_lon)) {
+            $plus_code = $order->get_meta('lpac_plus_code') ?: $order->get_meta('_shipping_plus_code');
             if (!empty($plus_code)) {
                 $coords = $this->plusCodeToLatLon($plus_code);
                 if ($coords) {
                     $customer_lat = $coords['lat'];
                     $customer_lon = $coords['lon'];
-                    update_post_meta($order_id, '_shipping_latitude', $customer_lat);
-                    update_post_meta($order_id, '_shipping_longitude', $customer_lon);
+                    // Save for future use
+                    $order->update_meta_data('lpac_latitude', $customer_lat);
+                    $order->update_meta_data('lpac_longitude', $customer_lon);
+                    $order->update_meta_data('_shipping_latitude', $customer_lat);
+                    $order->update_meta_data('_shipping_longitude', $customer_lon);
+                    $order->save();
                 }
             }
+        }
 
-            // If still no coordinates, use address geocoding
-            if (empty($customer_lat) || empty($customer_lon)) {
-                wp_send_json_error('Kunden-Koordinaten nicht verfügbar (Adresse geocoden?)');
-                return;
-            }
+        // If still no coordinates, cannot calculate
+        if (empty($customer_lat) || empty($customer_lon)) {
+            wp_send_json_error('Kunden-Koordinaten nicht verfügbar. Bitte Plus Code eingeben oder Adresse geocoden.');
+            return;
         }
 
         // Calculate route with OSRM
         $route = $this->calculateRouteOSRM(
-            $driver_position['latitude'],
-            $driver_position['longitude'],
-            $customer_lat,
-            $customer_lon
+            $start_lat,
+            $start_lon,
+            floatval($customer_lat),
+            floatval($customer_lon)
         );
 
         if (!$route) {
@@ -11150,20 +10598,33 @@ class DispatchDashboard {
         $eta_formatted = date('H:i', $eta_timestamp);
 
         // Store ETA in order meta
-        update_post_meta($order_id, '_delivery_eta_timestamp', $eta_timestamp);
-        update_post_meta($order_id, '_delivery_eta_formatted', $eta_formatted);
-        update_post_meta($order_id, '_delivery_distance_km', $route['distance_km']);
-        update_post_meta($order_id, '_delivery_duration_min', $route['duration_min']);
-        update_post_meta($order_id, '_delivery_eta_calculated_at', current_time('mysql'));
+        $order->update_meta_data('_delivery_eta_timestamp', $eta_timestamp);
+        $order->update_meta_data('_delivery_eta_formatted', $eta_formatted);
+        $order->update_meta_data('_delivery_distance_km', $route['distance_km']);
+        $order->update_meta_data('_delivery_duration_min', $route['duration_min']);
+        $order->update_meta_data('_delivery_eta_calculated_at', current_time('mysql'));
+        $order->update_meta_data('_delivery_eta_source', $source);
+        $order->save();
 
-        $driver = get_userdata($driver_id);
+        // Get driver name if assigned
+        $driver_name = 'Vom Depot';
+        if ($driver_id) {
+            $driver = get_userdata($driver_id);
+            if ($driver) {
+                $driver_name = $source === 'driver' ? $driver->display_name : $driver->display_name . ' (Depot)';
+            }
+        }
 
         wp_send_json_success([
             'eta' => $eta_formatted,
             'distance_km' => $route['distance_km'],
             'duration_min' => $route['duration_min'],
-            'driver_name' => $driver ? $driver->display_name : 'Unbekannt',
-            'driver_position' => $driver_position,
+            'driver_name' => $driver_name,
+            'source' => $source,
+            'start_position' => [
+                'latitude' => $start_lat,
+                'longitude' => $start_lon
+            ],
             'customer_position' => [
                 'latitude' => $customer_lat,
                 'longitude' => $customer_lon
@@ -11923,6 +11384,10 @@ class DispatchDashboard {
     /**
      * AJAX: Geocode Single Order
      */
+    /**
+     * AJAX: Geocode a single order
+     * v2.9.81: Supports force parameter to override existing coordinates
+     */
     public function ajaxGeocodeSingleOrder(): void {
         Dispatch_Security::verify_ajax_request('geocode_single_order', 'manage_woocommerce', true);
 
@@ -11931,23 +11396,39 @@ class DispatchDashboard {
         if (!current_user_can('manage_woocommerce')) {
             wp_send_json_error(['message' => 'Keine Berechtigung']);
         }
-        
+
         $order_id = intval($_POST['order_id']);
+        $force = isset($_POST['force']) && ($_POST['force'] === 'true' || $_POST['force'] === '1');
+
         $order = wc_get_order($order_id);
-        
+
         if (!$order) {
             wp_send_json_error(['message' => 'Bestellung nicht gefunden']);
         }
-        
-        $result = $this->geocodeOrder($order);
-        
+
+        // Get current coordinates for comparison
+        $old_lat = $order->get_meta('lpac_latitude');
+        $old_lng = $order->get_meta('lpac_longitude');
+
+        $result = $this->geocodeOrder($order, $force);
+
         if ($result['success']) {
-            wp_send_json_success([
+            $response = [
                 'message' => 'Adresse erfolgreich geocodiert',
-                'plus_code' => $result['plus_code'],
+                'plus_code' => $result['plus_code'] ?? '',
                 'latitude' => $result['latitude'],
-                'longitude' => $result['longitude']
-            ]);
+                'longitude' => $result['longitude'],
+                'source' => $result['source'] ?? 'unknown',
+                'was_cached' => $result['cached'] ?? false
+            ];
+
+            // Add info about coordinate change
+            if ($old_lat && $old_lng && !($result['cached'] ?? false)) {
+                $response['old_coordinates'] = "$old_lat, $old_lng";
+                $response['coordinates_changed'] = ($old_lat != $result['latitude'] || $old_lng != $result['longitude']);
+            }
+
+            wp_send_json_success($response);
         } else {
             wp_send_json_error([
                 'message' => 'Geocoding fehlgeschlagen: ' . $result['error']
@@ -11958,95 +11439,483 @@ class DispatchDashboard {
     /**
      * Geocode an order and save coordinates + Plus Code
      */
-    private function geocodeOrder($order): array {
+    /**
+     * Geocode an order address - HYBRID APPROACH with Plus Code priority
+     * v2.9.81: 1. Plus Code (if present) → 2. Google Maps → 3. Nominatim
+     *
+     * For Mallorca and areas without proper addresses, Plus Codes are essential!
+     *
+     * @param WC_Order $order The order to geocode
+     * @param bool $force Force geocoding even if coordinates exist
+     * @return array Result with success status and coordinates
+     */
+    private function geocodeOrder($order, bool $force = false): array {
         try {
-            // Build full address
-            $address_parts = [];
-            
-            // Get shipping address if available, otherwise billing
-            if ($order->get_shipping_address_1()) {
-                $street = $order->get_shipping_address_1();
-                $city = $order->get_shipping_city();
-                $postcode = $order->get_shipping_postcode();
-                $country = $order->get_shipping_country();
-            } else {
-                $street = $order->get_billing_address_1();
-                $city = $order->get_billing_city();
-                $postcode = $order->get_billing_postcode();
-                $country = $order->get_billing_country();
+            $order_id = $order->get_id();
+
+            // Check if valid coordinates already exist (unless forced)
+            if (!$force) {
+                $existing_lat = $order->get_meta('lpac_latitude');
+                $existing_lng = $order->get_meta('lpac_longitude');
+
+                if ($existing_lat && $existing_lng &&
+                    is_numeric($existing_lat) && is_numeric($existing_lng) &&
+                    $existing_lat != 0 && $existing_lng != 0) {
+                    return [
+                        'success' => true,
+                        'latitude' => $existing_lat,
+                        'longitude' => $existing_lng,
+                        'plus_code' => $this->generatePlusCodeFromCoordinates($existing_lat, $existing_lng),
+                        'cached' => true,
+                        'source' => 'existing'
+                    ];
+                }
             }
-            
-            if ($street) $address_parts[] = $street;
-            if ($postcode) $address_parts[] = $postcode;
-            if ($city) $address_parts[] = $city;
-            if ($country) $address_parts[] = $country;
-            
-            if (empty($address_parts)) {
-                return ['success' => false, 'error' => 'Keine Adresse vorhanden'];
+
+            // PRIORITY 1: Try to find and decode Plus Code from address fields
+            $plus_code = $this->extractPlusCodeFromOrder($order);
+            if ($plus_code) {
+                $result = $this->decodePlusCodeToCoordinates($plus_code);
+                if ($result['success']) {
+                    $this->saveGeocodingResult($order, $result, "Plus Code: $plus_code", 'pluscode');
+                    error_log("Plus Code decoded for order #$order_id: $plus_code → {$result['latitude']}, {$result['longitude']}");
+                    return $result;
+                }
             }
-            
-            $full_address = implode(', ', $address_parts);
-            
-            // Get Google Maps API key
-            $api_key = get_option('dispatch_google_maps_api_key', '');
-            if (!$api_key) {
-                return ['success' => false, 'error' => 'Google Maps API Key nicht konfiguriert'];
+
+            // Build full address for geocoding
+            $address_data = $this->buildOrderAddress($order);
+            if (!$address_data['success']) {
+                return ['success' => false, 'error' => $address_data['error']];
             }
-            
-            // Geocode the address
-            $geocode_url = 'https://maps.googleapis.com/maps/api/geocode/json?' . http_build_query([
-                'address' => $full_address,
-                'key' => $api_key
-            ]);
-            
-            $response = wp_remote_get($geocode_url);
-            
-            if (is_wp_error($response)) {
-                return ['success' => false, 'error' => $response->get_error_message()];
-            }
-            
-            $body = wp_remote_retrieve_body($response);
-            $data = json_decode($body, true);
-            
-            if ($data['status'] !== 'OK' || empty($data['results'])) {
-                return ['success' => false, 'error' => 'Adresse konnte nicht gefunden werden'];
-            }
-            
-            $location = $data['results'][0]['geometry']['location'];
-            $latitude = $location['lat'];
-            $longitude = $location['lng'];
-            
-            // Get Plus Code from the response if available
-            $plus_code = '';
-            if (isset($data['results'][0]['plus_code']['global_code'])) {
-                $plus_code = $data['results'][0]['plus_code']['global_code'];
-            } else {
-                // Generate Plus Code from coordinates
-                $plus_code = $this->generatePlusCodeFromCoordinates($latitude, $longitude);
-            }
-            
-            // Save to order meta
-            update_post_meta($order->get_id(), '_billing_latitude', $latitude);
-            update_post_meta($order->get_id(), '_billing_longitude', $longitude);
-            update_post_meta($order->get_id(), '_billing_plus_code', $plus_code);
-            
-            // Also save to shipping if it was a shipping address
-            if ($order->get_shipping_address_1()) {
-                update_post_meta($order->get_id(), '_shipping_latitude', $latitude);
-                update_post_meta($order->get_id(), '_shipping_longitude', $longitude);
-                update_post_meta($order->get_id(), '_shipping_plus_code', $plus_code);
-            }
-            
-            return [
-                'success' => true,
-                'latitude' => $latitude,
-                'longitude' => $longitude,
-                'plus_code' => $plus_code
+
+            $full_address = $address_data['address'];
+            $country = $address_data['country'];
+
+            // PRIORITY 2: Try Google Maps (more accurate)
+            // Try both API keys: dispatch key first, then LPAC key (one may be backend-enabled)
+            $api_keys = [
+                get_option('lpac_google_maps_api_key', ''),      // LPAC key often works for backend
+                get_option('dispatch_google_maps_api_key', '')   // Dispatch key (may have referer restrictions)
             ];
-            
+
+            foreach (array_filter($api_keys) as $google_api_key) {
+                $result = $this->geocodeWithGoogle($full_address, $google_api_key);
+                if ($result['success']) {
+                    $this->saveGeocodingResult($order, $result, $full_address, 'google');
+                    return $result;
+                }
+            }
+            error_log("Google geocoding failed for order #$order_id (tried " . count(array_filter($api_keys)) . " API keys), trying Nominatim fallback");
+
+            // PRIORITY 3: Fallback to Nominatim (free)
+            $result = $this->geocodeWithNominatim($full_address, $country);
+            if ($result['success']) {
+                $this->saveGeocodingResult($order, $result, $full_address, 'nominatim');
+                return $result;
+            }
+
+            return ['success' => false, 'error' => "Adresse nicht gefunden: $full_address"];
+
         } catch (Exception $e) {
+            error_log("Geocoding exception for order #" . $order->get_id() . ": " . $e->getMessage());
             return ['success' => false, 'error' => $e->getMessage()];
         }
+    }
+
+    /**
+     * Extract Plus Code from order address fields
+     * Checks: shipping_address_1, billing_address_1, lpac_places_autocomplete, notes
+     *
+     * Plus Code format: 8 chars + optional local code (e.g., "8CHW+X5" or "8CHW+X5 Bunyola")
+     */
+    private function extractPlusCodeFromOrder($order): ?string {
+        // Fields to check for Plus Code
+        $fields_to_check = [
+            $order->get_meta('lpac_places_autocomplete'),
+            $order->get_meta('_plus_code'),
+            $order->get_shipping_address_1(),
+            $order->get_billing_address_1(),
+            $order->get_customer_note()
+        ];
+
+        // Plus Code pattern: Global (e.g., "8CHW+X5") or Full (e.g., "8FVHCFX5+R5")
+        // Can also be compound: "8CHW+X5 Bunyola" or "8CHW+X5, Palma"
+        $plus_code_pattern = '/\b([23456789CFGHJMPQRVWX]{4,8}\+[23456789CFGHJMPQRVWX]{2,3})(?:\s|,|$)/i';
+
+        foreach ($fields_to_check as $field) {
+            if (empty($field)) continue;
+
+            // Try to match Plus Code in the field
+            if (preg_match($plus_code_pattern, strtoupper($field), $matches)) {
+                return $matches[1];
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Decode Plus Code to coordinates using OpenLocationCode library
+     */
+    private function decodePlusCodeToCoordinates(string $plus_code): array {
+        if (!class_exists('OpenLocationCode\OpenLocationCode')) {
+            return ['success' => false, 'error' => 'OpenLocationCode library not available'];
+        }
+
+        try {
+            // Clean up the Plus Code
+            $plus_code = strtoupper(trim($plus_code));
+
+            // For short Plus Codes (e.g., "8CHW+X5"), we need a reference location
+            // Mallorca center: 39.5696, 2.6502
+            $reference_lat = 39.5696;
+            $reference_lng = 2.6502;
+
+            $olc = new \OpenLocationCode\OpenLocationCode();
+
+            // Check if it's a short code that needs recovery
+            if (strlen(str_replace('+', '', $plus_code)) < 8) {
+                // Short code - recover full code using Mallorca reference
+                $plus_code = $olc->recoverNearest($plus_code, $reference_lat, $reference_lng);
+            }
+
+            // Validate the code
+            if (!$olc->isValid($plus_code)) {
+                return ['success' => false, 'error' => "Ungültiger Plus Code: $plus_code"];
+            }
+
+            // Decode to coordinates
+            $decoded = $olc->decode($plus_code);
+
+            $latitude = ($decoded->getLatitudeLo() + $decoded->getLatitudeHi()) / 2;
+            $longitude = ($decoded->getLongitudeLo() + $decoded->getLongitudeHi()) / 2;
+
+            return [
+                'success' => true,
+                'latitude' => round($latitude, 7),
+                'longitude' => round($longitude, 7),
+                'plus_code' => $plus_code,
+                'source' => 'pluscode'
+            ];
+
+        } catch (Exception $e) {
+            error_log("Plus Code decode error for '$plus_code': " . $e->getMessage());
+            return ['success' => false, 'error' => $e->getMessage()];
+        }
+    }
+
+    /**
+     * Build address string from order
+     */
+    private function buildOrderAddress($order): array {
+        $address_parts = [];
+
+        // Get shipping address if available, otherwise billing
+        if ($order->get_shipping_address_1()) {
+            $street = $order->get_shipping_address_1();
+            $city = $order->get_shipping_city();
+            $postcode = $order->get_shipping_postcode();
+            $country = $order->get_shipping_country() ?: 'ES';
+        } else {
+            $street = $order->get_billing_address_1();
+            $city = $order->get_billing_city();
+            $postcode = $order->get_billing_postcode();
+            $country = $order->get_billing_country() ?: 'ES';
+        }
+
+        if ($street) $address_parts[] = $street;
+        if ($postcode) $address_parts[] = $postcode;
+        if ($city) $address_parts[] = $city;
+
+        // Add country name for better results
+        $country_names = [
+            'ES' => 'Spain', 'DE' => 'Germany', 'AT' => 'Austria',
+            'CH' => 'Switzerland', 'FR' => 'France', 'IT' => 'Italy'
+        ];
+        $country_name = $country_names[$country] ?? $country;
+        $address_parts[] = $country_name;
+
+        if (count($address_parts) < 2) {
+            return ['success' => false, 'error' => 'Keine vollständige Adresse vorhanden'];
+        }
+
+        return [
+            'success' => true,
+            'address' => implode(', ', $address_parts),
+            'country' => $country
+        ];
+    }
+
+    /**
+     * Geocode using Google Maps API (more accurate)
+     */
+    private function geocodeWithGoogle(string $address, string $api_key): array {
+        $geocode_url = 'https://maps.googleapis.com/maps/api/geocode/json?' . http_build_query([
+            'address' => $address,
+            'key' => $api_key,
+            'language' => 'es'
+        ]);
+
+        $response = wp_remote_get($geocode_url, ['timeout' => 10]);
+
+        if (is_wp_error($response)) {
+            return ['success' => false, 'error' => $response->get_error_message()];
+        }
+
+        $body = wp_remote_retrieve_body($response);
+        $data = json_decode($body, true);
+
+        if (!isset($data['status']) || $data['status'] !== 'OK' || empty($data['results'])) {
+            $error_msg = $data['error_message'] ?? ($data['status'] ?? 'Unknown error');
+            return ['success' => false, 'error' => $error_msg];
+        }
+
+        $location = $data['results'][0]['geometry']['location'];
+        $latitude = floatval($location['lat']);
+        $longitude = floatval($location['lng']);
+
+        // Get Plus Code from Google response if available
+        $plus_code = '';
+        if (isset($data['results'][0]['plus_code']['global_code'])) {
+            $plus_code = $data['results'][0]['plus_code']['global_code'];
+        } else {
+            $plus_code = $this->generatePlusCodeFromCoordinates($latitude, $longitude);
+        }
+
+        return [
+            'success' => true,
+            'latitude' => $latitude,
+            'longitude' => $longitude,
+            'plus_code' => $plus_code,
+            'source' => 'google',
+            'formatted_address' => $data['results'][0]['formatted_address'] ?? $address
+        ];
+    }
+
+    /**
+     * Geocode using OpenStreetMap Nominatim (free fallback)
+     * v2.9.81: Enhanced with multiple search strategies for Spanish/Catalan addresses
+     */
+    private function geocodeWithNominatim(string $address, string $country = 'ES'): array {
+        // Rate limiting: Nominatim requires 1 request per second
+        $this->waitForNominatimRateLimit();
+
+        // Try multiple address variations (Spanish addresses can be tricky)
+        $address_variations = $this->generateAddressVariations($address);
+
+        foreach ($address_variations as $variation) {
+            $result = $this->nominatimRequest($variation, $country);
+            if ($result['success']) {
+                return $result;
+            }
+            // Wait between retries
+            usleep(1100000);
+        }
+
+        return ['success' => false, 'error' => 'Adresse nicht gefunden'];
+    }
+
+    /**
+     * Wait for Nominatim rate limit (1 request per second)
+     */
+    private function waitForNominatimRateLimit(): void {
+        $last_request = get_transient('dispatch_nominatim_last_request');
+        if ($last_request && (time() - $last_request) < 1) {
+            usleep(1100000);
+        }
+        set_transient('dispatch_nominatim_last_request', time(), 60);
+    }
+
+    /**
+     * Generate address variations for better Nominatim matching
+     * Handles Spanish/Catalan street name variations
+     */
+    private function generateAddressVariations(string $address): array {
+        $variations = [$address];
+
+        // Spanish/Catalan abbreviation mappings
+        $replacements = [
+            // Spanish -> Full
+            '/\bC\/\s*/i' => 'Calle ',
+            '/\bAv\.\s*/i' => 'Avenida ',
+            '/\bAvda\.\s*/i' => 'Avenida ',
+            '/\bPza\.\s*/i' => 'Plaza ',
+            '/\bPl\.\s*/i' => 'Plaza ',
+            '/\bPº\s*/i' => 'Paseo ',
+            '/\bCtra\.\s*/i' => 'Carretera ',
+
+            // Catalan alternatives
+            '/\bCarrer\s+de\s+/i' => 'Carrer ',
+            '/\bAvinguda\s+de\s+/i' => 'Avinguda ',
+        ];
+
+        // Create variation with expanded abbreviations
+        $expanded = $address;
+        foreach ($replacements as $pattern => $replacement) {
+            $expanded = preg_replace($pattern, $replacement, $expanded);
+        }
+        if ($expanded !== $address) {
+            $variations[] = $expanded;
+        }
+
+        // Try without "de" articles (common in Catalan)
+        $without_de = preg_replace('/\s+de\s+/i', ' ', $address);
+        if ($without_de !== $address) {
+            $variations[] = $without_de;
+        }
+
+        // For Palma addresses, try with "Palma de Mallorca"
+        if (stripos($address, 'Palma') !== false && stripos($address, 'Mallorca') === false) {
+            $variations[] = str_ireplace('Palma', 'Palma de Mallorca', $address);
+        }
+
+        // Try just street + city (without postal code)
+        $parts = explode(',', $address);
+        if (count($parts) >= 3) {
+            // Street, City, Country
+            $simple = trim($parts[0]) . ', ' . trim($parts[count($parts) - 2]) . ', ' . trim($parts[count($parts) - 1]);
+            $variations[] = $simple;
+        }
+
+        return array_unique($variations);
+    }
+
+    /**
+     * Make a single Nominatim API request
+     */
+    private function nominatimRequest(string $address, string $country): array {
+        $geocode_url = 'https://nominatim.openstreetmap.org/search?' . http_build_query([
+            'q' => $address,
+            'format' => 'json',
+            'limit' => 1,
+            'countrycodes' => strtolower($country),
+            'addressdetails' => 1
+        ]);
+
+        $response = wp_remote_get($geocode_url, [
+            'headers' => [
+                'User-Agent' => 'DispatchSecure/2.9.81 (WordPress Plugin; contact@entreagua.com)'
+            ],
+            'timeout' => 10
+        ]);
+
+        if (is_wp_error($response)) {
+            return ['success' => false, 'error' => $response->get_error_message()];
+        }
+
+        $body = wp_remote_retrieve_body($response);
+        $data = json_decode($body, true);
+
+        if (empty($data) || !isset($data[0]['lat']) || !isset($data[0]['lon'])) {
+            return ['success' => false, 'error' => 'Adresse nicht gefunden'];
+        }
+
+        $latitude = floatval($data[0]['lat']);
+        $longitude = floatval($data[0]['lon']);
+        $plus_code = $this->generatePlusCodeFromCoordinates($latitude, $longitude);
+
+        return [
+            'success' => true,
+            'latitude' => $latitude,
+            'longitude' => $longitude,
+            'plus_code' => $plus_code,
+            'source' => 'nominatim',
+            'formatted_address' => $data[0]['display_name'] ?? $address
+        ];
+    }
+
+    /**
+     * Save geocoding result to order meta (HPOS compatible)
+     */
+    private function saveGeocodingResult($order, array $result, string $address, string $source): void {
+        $order->update_meta_data('lpac_latitude', $result['latitude']);
+        $order->update_meta_data('lpac_longitude', $result['longitude']);
+        $order->update_meta_data('_shipping_latitude', $result['latitude']);
+        $order->update_meta_data('_shipping_longitude', $result['longitude']);
+        $order->update_meta_data('_billing_latitude', $result['latitude']);
+        $order->update_meta_data('_billing_longitude', $result['longitude']);
+        $order->update_meta_data('_geocoded_address', $address);
+        $order->update_meta_data('_geocoded_at', current_time('mysql'));
+        $order->update_meta_data('_geocoded_source', $source);
+
+        if (!empty($result['plus_code'])) {
+            $order->update_meta_data('_plus_code', $result['plus_code']);
+            $order->update_meta_data('_shipping_plus_code', $result['plus_code']);
+            $order->update_meta_data('_billing_plus_code', $result['plus_code']);
+        }
+
+        $order->save();
+
+        error_log("Geocoding saved for order #{$order->get_id()}: {$result['latitude']}, {$result['longitude']} (source: $source)");
+    }
+
+    /**
+     * Check if order coordinates need geocoding
+     * Returns true if coordinates are missing, invalid, or potentially duplicated
+     */
+    private function orderNeedsGeocoding($order): bool {
+        $lat = $order->get_meta('lpac_latitude');
+        $lng = $order->get_meta('lpac_longitude');
+
+        // No coordinates
+        if (!$lat || !$lng) return true;
+
+        // Invalid coordinates
+        if (!is_numeric($lat) || !is_numeric($lng)) return true;
+
+        // Zero coordinates
+        if (floatval($lat) == 0 || floatval($lng) == 0) return true;
+
+        return false;
+    }
+
+    /**
+     * AJAX: Geocode multiple orders with duplicate detection
+     * v2.9.81: Detects and fixes orders with duplicate coordinates
+     */
+    public function ajaxGeocodeOrdersWithDuplicateCheck(): void {
+        Dispatch_Security::verify_ajax_request('geocode_orders', 'manage_woocommerce', true);
+
+        $order_ids = isset($_POST['order_ids']) ? array_map('intval', (array)$_POST['order_ids']) : [];
+        $force = isset($_POST['force']) && $_POST['force'] === 'true';
+
+        if (empty($order_ids)) {
+            wp_send_json_error(['message' => 'Keine Bestellungen ausgewählt']);
+        }
+
+        $results = [];
+        $success_count = 0;
+        $error_count = 0;
+
+        foreach ($order_ids as $order_id) {
+            $order = wc_get_order($order_id);
+            if (!$order) {
+                $results[] = ['order_id' => $order_id, 'success' => false, 'error' => 'Bestellung nicht gefunden'];
+                $error_count++;
+                continue;
+            }
+
+            $result = $this->geocodeOrder($order, $force);
+            $result['order_id'] = $order_id;
+            $results[] = $result;
+
+            if ($result['success']) {
+                $success_count++;
+            } else {
+                $error_count++;
+            }
+
+            // Rate limiting between requests
+            usleep(1100000); // 1.1 seconds to respect Nominatim policy
+        }
+
+        wp_send_json_success([
+            'message' => "$success_count von " . count($order_ids) . " Bestellungen erfolgreich geocodiert",
+            'success_count' => $success_count,
+            'error_count' => $error_count,
+            'results' => $results
+        ]);
     }
     
     /**
@@ -13416,8 +13285,14 @@ class DispatchDashboard {
         // Format orders for API response
         $formatted_orders = [];
         foreach ($wc_orders as $order) {
-            // Get delivery date and time
+            // Get delivery date and time (check multiple meta fields)
             $delivery_date = $order->get_meta('Gewünschtes Lieferdatum');
+            if (empty($delivery_date)) {
+                $delivery_date = $order->get_meta('Lieferdatum');
+            }
+            if (empty($delivery_date)) {
+                $delivery_date = $order->get_meta('_delivery_date');
+            }
             $delivery_time = $order->get_meta('Gewünschtes Zeitfenster - unverbindlich');
 
             // Format delivery datetime
@@ -13551,60 +13426,6 @@ class DispatchDashboard {
         ]);
     }
 
-    /**
-     * Helper: Get orders for a specific driver
-     */
-    private function getDriverOrders($driver_id): array {
-        // Hole ALLE Aufträge mit dem entsprechenden Status
-        $args = [
-            'status' => ['processing', 'on-hold', 'pending'],
-            'limit' => -1
-        ];
-
-        $all_status_orders = wc_get_orders($args);
-
-        // Filtere manuell nach zugewiesenem Fahrer (HPOS-kompatibel)
-        $all_orders = [];
-        foreach ($all_status_orders as $order) {
-            // Verwende order->get_meta für HPOS-Kompatibilität
-            $assigned_driver = $order->get_meta('_assigned_driver');
-            if ($assigned_driver == $driver_id) {
-                $all_orders[] = $order;
-            }
-        }
-
-        // Filter for TODAY's and FUTURE orders (not past orders)
-        $today = new DateTime('today', wp_timezone());
-        $today->setTime(0, 0, 0);
-        $current_orders = [];
-
-        foreach ($all_orders as $order) {
-            // Try multiple meta fields for delivery date (Order Delivery Date plugin compatibility)
-            $delivery_date_str = $order->get_meta('Lieferdatum');
-            if (empty($delivery_date_str)) {
-                $delivery_date_str = $order->get_meta('Gewünschtes Lieferdatum');
-            }
-            if (empty($delivery_date_str)) {
-                $delivery_date_str = $order->get_meta('_delivery_date'); // Order Delivery Date plugin
-            }
-
-            if ($delivery_date_str) {
-                $delivery_date = $this->parseDeliveryDate($delivery_date_str);
-                if ($delivery_date) {
-                    $delivery_date->setTime(0, 0, 0);
-                    // Include ONLY today's orders (not future)
-                    if ($delivery_date->format('Y-m-d') === $today->format('Y-m-d')) {
-                        $current_orders[] = $order;
-                    }
-                }
-            } else {
-                // Include orders without delivery date as they are considered "today"
-                $current_orders[] = $order;
-            }
-        }
-
-        return $current_orders;
-    }
 
     /**
      * AJAX: Toggle Driver Online Status and Check for Orders
@@ -13880,6 +13701,7 @@ class DispatchDashboard {
      */
     /**
      * AJAX: Get completed orders for driver
+     * Fixed 2025-11-27: Include 'delivered' status and use date_modified fallback
      */
     public function ajaxGetCompletedOrders(): void {
         Dispatch_Security::verify_ajax_request('get_completed_orders', 'manage_woocommerce', true);
@@ -13892,11 +13714,11 @@ class DispatchDashboard {
 
         // Get user ID with fallback methods
         $user_id = get_current_user_id();
-        
+
         if (!$user_id && isset($_COOKIE['driver_user_id'])) {
             $user_id = intval($_COOKIE['driver_user_id']);
         }
-        
+
         if (!$user_id) {
             // Get first driver for testing
             $drivers = get_users(['role' => 'lieferfahrer', 'number' => 1]);
@@ -13904,75 +13726,173 @@ class DispatchDashboard {
                 $user_id = $drivers[0]->ID;
             }
         }
-        
+
         if (!$user_id) {
             wp_send_json_error('Nicht eingeloggt');
             return;
         }
-        
+
         $period = isset($_POST['period']) ? sanitize_text_field($_POST['period']) : 'heute';
-        
+
         // Calculate date range
-        $date_query = [];
         $today = new DateTime('today', wp_timezone());
-        
+        $yesterday = new DateTime('yesterday', wp_timezone());
+
         switch ($period) {
             case 'heute':
-                $date_query = [
-                    'after' => $today->format('Y-m-d 00:00:00'),
-                    'before' => $today->format('Y-m-d 23:59:59'),
-                ];
+                $filter_date = $today->format('Y-m-d');
+                break;
+            case 'gestern':
+                $filter_date = $yesterday->format('Y-m-d');
                 break;
             case 'woche':
                 $week_start = clone $today;
                 $week_start->modify('monday this week');
-                $date_query = [
-                    'after' => $week_start->format('Y-m-d 00:00:00'),
-                    'before' => $today->format('Y-m-d 23:59:59'),
-                ];
+                $filter_date_start = $week_start->format('Y-m-d');
+                $filter_date_end = $today->format('Y-m-d');
                 break;
             case 'monat':
                 $month_start = clone $today;
                 $month_start->modify('first day of this month');
-                $date_query = [
-                    'after' => $month_start->format('Y-m-d 00:00:00'),
-                    'before' => $today->format('Y-m-d 23:59:59'),
-                ];
+                $filter_date_start = $month_start->format('Y-m-d');
+                $filter_date_end = $today->format('Y-m-d');
                 break;
+            default:
+                $filter_date = $today->format('Y-m-d');
         }
-        
-        // Get completed orders
+
+        // Get ALL completed/delivered orders for this driver (we filter by date in PHP)
+        // Include both 'completed' and 'delivered' status
         $args = [
-            'status' => 'completed',
-            'limit' => 200,
+            'status' => ['completed', 'delivered'],
+            'limit' => 500,
             'orderby' => 'date',
             'order' => 'DESC',
-        ];
-        
-        if (!empty($date_query)) {
-            $args['date_completed'] = $date_query['after'] . '...' . $date_query['before'];
-        }
-        
-        // Add meta query to filter by driver
-        $args['meta_query'] = [
-            [
-                'key' => '_assigned_driver',
-                'value' => $user_id,
-                'compare' => '='
+            'meta_query' => [
+                [
+                    'key' => '_assigned_driver',
+                    'value' => $user_id,
+                    'compare' => '='
+                ]
             ]
         ];
-        
-        $orders = wc_get_orders($args);
+
+        $all_orders = wc_get_orders($args);
+
+        // Filter orders by completion date in PHP
+        // This is needed because 'delivered' status doesn't set date_completed
+        $orders = [];
+        foreach ($all_orders as $order) {
+            $order_completed_date = null;
+
+            // First check WooCommerce's date_completed (set for 'completed' status)
+            $date_completed = $order->get_date_completed();
+            if ($date_completed) {
+                $order_completed_date = $date_completed->format('Y-m-d');
+            }
+
+            // Fallback: Check _delivery_completed_at meta
+            if (!$order_completed_date) {
+                $delivery_completed = $order->get_meta('_delivery_completed_at');
+                if ($delivery_completed) {
+                    $order_completed_date = date('Y-m-d', strtotime($delivery_completed));
+                }
+            }
+
+            // Final fallback for 'delivered' status: use date_modified
+            if (!$order_completed_date && $order->get_status() === 'delivered') {
+                $date_modified = $order->get_date_modified();
+                if ($date_modified) {
+                    $order_completed_date = $date_modified->format('Y-m-d');
+                }
+            }
+
+            // Match against date filter
+            if (isset($filter_date)) {
+                // Single day filter (heute/gestern)
+                if ($order_completed_date === $filter_date) {
+                    $orders[] = $order;
+                }
+            } elseif (isset($filter_date_start) && isset($filter_date_end)) {
+                // Date range filter (woche/monat)
+                if ($order_completed_date >= $filter_date_start && $order_completed_date <= $filter_date_end) {
+                    $orders[] = $order;
+                }
+            }
+        }
         
         $formatted_orders = [];
         foreach ($orders as $order) {
+            // Get completion time
+            $completed_time = '';
+            $date_completed = $order->get_date_completed();
+            if ($date_completed) {
+                $completed_time = $date_completed->format('H:i') . ' Uhr';
+            } elseif ($order->get_status() === 'delivered') {
+                // For delivered orders, use date_modified
+                $date_modified = $order->get_date_modified();
+                if ($date_modified) {
+                    $completed_time = $date_modified->format('H:i') . ' Uhr';
+                }
+            }
+
+            // Get delivery address (prefer shipping, fallback to billing)
+            $address = $order->get_shipping_address_1() ?: $order->get_billing_address_1();
+            $postcode = $order->get_shipping_postcode() ?: $order->get_billing_postcode();
+            $city = $order->get_shipping_city() ?: $order->get_billing_city();
+            $delivery_address = trim($address . ', ' . $postcode . ' ' . $city);
+
+            // Get delivery date/time
+            $delivery_datetime = '';
+            $delivery_date = $order->get_meta('_delivery_date');
+            $delivery_time = $order->get_meta('_delivery_time');
+
+            // Fallback to ORDDD Lite timestamp
+            if (!$delivery_date) {
+                $orddd_timestamp = $order->get_meta('_orddd_lite_timestamp');
+                if ($orddd_timestamp) {
+                    $delivery_date = date('Y-m-d', $orddd_timestamp);
+                }
+            }
+
+            // Fallback to ORDDD time slot
+            if (!$delivery_time) {
+                $time_slot = $order->get_meta('_orddd_time_slot');
+                if ($time_slot && $time_slot !== 'asap') {
+                    // Add "Uhr" to time slots like "10:00 - 13:30"
+                    $delivery_time = $time_slot . ' Uhr';
+                } elseif ($time_slot === 'asap') {
+                    $delivery_time = 'schnellstmöglich';
+                }
+            }
+
+            if ($delivery_date) {
+                // Try to parse and format the date
+                $parsed_date = DateTime::createFromFormat('Y-m-d', $delivery_date);
+                if (!$parsed_date) {
+                    $parsed_date = DateTime::createFromFormat('d.m.Y', $delivery_date);
+                }
+                if ($parsed_date) {
+                    $delivery_datetime = $parsed_date->format('d.m.Y');
+                    if ($delivery_time) {
+                        $delivery_datetime .= ' ' . $delivery_time;
+                    }
+                } else {
+                    $delivery_datetime = $delivery_date;
+                    if ($delivery_time) {
+                        $delivery_datetime .= ' ' . $delivery_time;
+                    }
+                }
+            }
+
             $formatted_orders[] = [
                 'id' => $order->get_id(),
                 'order_number' => $order->get_order_number(),
-                'customer_name' => $order->get_billing_first_name() . ' ' . $order->get_billing_last_name(),
-                'customer_address' => $order->get_billing_address_1() . ', ' . $order->get_billing_postcode() . ' ' . $order->get_billing_city(),
-                'total' => $order->get_total(),
-                'date_completed' => $order->get_date_completed() ? $order->get_date_completed()->format('d.m.Y H:i') : '',
+                'customer_name' => esc_html($order->get_billing_first_name() . ' ' . $order->get_billing_last_name()),
+                'delivery_address' => esc_html($delivery_address),
+                'delivery_datetime' => $delivery_datetime ?: 'Nicht angegeben',
+                'completed_time' => $completed_time ?: '-',
+                'total' => number_format((float)$order->get_total(), 2, ',', '.'),
                 'rating' => $order->get_meta('_driver_rating_stars') ?: $order->get_meta('driver_rating') ?: 0,
             ];
         }
@@ -14020,53 +13940,6 @@ class DispatchDashboard {
         }
     }
     
-    /**
-     * Send SMS via Twilio API
-     */
-    private function sendSMSViaTwilio($account_sid, $auth_token, $from, $to, $message): array {
-        $url = "https://api.twilio.com/2010-04-01/Accounts/{$account_sid}/Messages.json";
-        
-        $data = [
-            'From' => $from,
-            'To' => $to,
-            'Body' => $message
-        ];
-        
-        $args = [
-            'body' => $data,
-            'timeout' => 15,
-            'headers' => [
-                'Authorization' => 'Basic ' . base64_encode($account_sid . ':' . $auth_token),
-                'Content-Type' => 'application/x-www-form-urlencoded'
-            ]
-        ];
-        
-        $response = wp_remote_post($url, $args);
-        
-        if (is_wp_error($response)) {
-            return [
-                'success' => false,
-                'error' => 'Verbindungsfehler: ' . $response->get_error_message()
-            ];
-        }
-        
-        $status_code = wp_remote_retrieve_response_code($response);
-        $body = wp_remote_retrieve_body($response);
-        $data = json_decode($body, true);
-        
-        if ($status_code >= 200 && $status_code < 300) {
-            return [
-                'success' => true,
-                'data' => $data
-            ];
-        } else {
-            $error_message = $data['message'] ?? 'Unbekannter Fehler';
-            return [
-                'success' => false,
-                'error' => "Twilio Fehler: {$error_message}"
-            ];
-        }
-    }
     
     /**
      * AJAX: Get all driver status for admin dashboard
@@ -14183,6 +14056,7 @@ class DispatchDashboard {
     
     /**
      * AJAX: Get completed orders for current driver by period
+     * Fixed 2025-11-27: Use WooCommerce date_completed instead of _completed_date meta
      */
     public function ajaxGetDriverCompletedOrders(): void {
         Dispatch_Security::verify_driver_access(true);
@@ -14191,62 +14065,85 @@ class DispatchDashboard {
         if (isset($_POST['nonce'])) {
             check_ajax_referer('dispatch_nonce', 'nonce');
         }
-        
+
         // Get user ID - if not logged in via WordPress, check for driver session
         $user_id = get_current_user_id();
-        
+
         if (!$user_id && isset($_COOKIE['driver_user_id'])) {
             $user_id = intval($_COOKIE['driver_user_id']);
         }
-        
+
         if (!$user_id) {
             wp_send_json_error('Nicht eingeloggt');
             return;
         }
-        
+
         $period = sanitize_text_field($_POST['period'] ?? 'heute');
-        
+
         // Set date range based on period
         $today = current_time('Y-m-d');
         $yesterday = date('Y-m-d', strtotime($today . ' -1 day'));
-        
+
         $date_filter = ($period === 'heute') ? $today : $yesterday;
-        
-        // Get completed orders for this driver on the specified date
+
+        // Get completed/delivered orders for this driver
+        // Include both 'completed' and 'delivered' status
         $args = [
             'limit' => -1,
-            'status' => ['completed'],
+            'status' => ['completed', 'delivered'],
             'meta_query' => [
-                'relation' => 'AND',
                 [
                     'key' => '_assigned_driver',
                     'value' => $user_id,
                     'compare' => '='
-                ],
-                [
-                    'key' => '_completed_date',
-                    'value' => $date_filter,
-                    'compare' => 'LIKE'
                 ]
             ],
             'orderby' => 'date_completed',
             'order' => 'DESC'
         ];
-        
-        $orders = wc_get_orders($args);
-        
-        // If no orders found with _completed_date, try with order date
-        if (empty($orders)) {
-            $args['meta_query'] = [
-                [
-                    'key' => '_assigned_driver',
-                    'value' => $user_id,
-                    'compare' => '='
-                ]
-            ];
-            
-            $args['date_completed'] = $date_filter;
-            $orders = wc_get_orders($args);
+
+        $all_orders = wc_get_orders($args);
+
+        // Filter orders by completion date
+        $orders = [];
+        foreach ($all_orders as $order) {
+            $order_completed_date = null;
+
+            // First check WooCommerce's date_completed (set for 'completed' status)
+            $date_completed = $order->get_date_completed();
+            if ($date_completed) {
+                $order_completed_date = $date_completed->format('Y-m-d');
+            }
+
+            // Fallback: Check _delivery_completed_at meta
+            if (!$order_completed_date) {
+                $delivery_completed = get_post_meta($order->get_id(), '_delivery_completed_at', true);
+                if ($delivery_completed) {
+                    $order_completed_date = date('Y-m-d', strtotime($delivery_completed));
+                }
+            }
+
+            // Fallback: Check _completed_date meta
+            if (!$order_completed_date) {
+                $completed_date_meta = get_post_meta($order->get_id(), '_completed_date', true);
+                if ($completed_date_meta) {
+                    $order_completed_date = date('Y-m-d', strtotime($completed_date_meta));
+                }
+            }
+
+            // Final fallback for 'delivered' status: use date_modified
+            // WooCommerce doesn't set date_completed for custom statuses like 'delivered'
+            if (!$order_completed_date && $order->get_status() === 'delivered') {
+                $date_modified = $order->get_date_modified();
+                if ($date_modified) {
+                    $order_completed_date = $date_modified->format('Y-m-d');
+                }
+            }
+
+            // Match against date filter
+            if ($order_completed_date === $date_filter) {
+                $orders[] = $order;
+            }
         }
         
         $formatted_orders = [];
@@ -14272,20 +14169,23 @@ class DispatchDashboard {
             
             $full_address = trim($customer_address . ', ' . $customer_postcode . ' ' . $customer_city);
             
-            // Get completion time
+            // Get completion time (PHP 8.3 null-safety)
             $completed_time = '';
             $completed_date_meta = get_post_meta($order->get_id(), '_completed_date', true);
             if ($completed_date_meta) {
                 $completed_time = date('H:i', strtotime($completed_date_meta));
-            } else if ($order->get_date_completed()) {
-                $completed_time = $order->get_date_completed()->format('H:i');
+            } else {
+                $date_completed = $order->get_date_completed();
+                if ($date_completed) {
+                    $completed_time = $date_completed->format('H:i');
+                }
             }
-            
+
             $formatted_orders[] = [
                 'id' => $order->get_id(),
                 'order_number' => $order->get_order_number(),
-                'customer_name' => $customer_name,
-                'delivery_address' => $full_address,
+                'customer_name' => esc_html($customer_name),
+                'delivery_address' => esc_html($full_address),
                 'delivery_datetime' => $delivery_datetime ?: 'Nicht angegeben',
                 'completed_time' => $completed_time ?: 'Nicht verfügbar',
                 'total' => number_format($order->get_total(), 2, ',', '.'),
@@ -15229,15 +15129,9 @@ class DispatchDashboard {
         $driver = get_userdata($user_id);
         $driver_name = $driver ? $driver->display_name : 'Fahrer #' . $user_id;
 
-        // CRITICAL: Set suppression flag for ALL orders BEFORE processing
-        // This prevents notification spam when driver checks items in packing list
-        foreach ($order_ids as $order_id_raw) {
-            $order_id = intval(trim($order_id_raw));
-            if ($order_id > 0) {
-                set_transient('dispatch_suppress_notifications_' . $order_id, true, 60);
-                error_log("🚫 Suppression FLAG SET for order #$order_id (packliste) - valid for 60 seconds");
-            }
-        }
+        // NOTE: Suppression flag is set during item-by-item packing (ajaxUpdateItemPackedStatus)
+        // When completing the entire packing list, we WANT to send SMS notifications!
+        // So we DON'T set the suppression flag here.
 
         // Mark each order as packed and ready
         $successfully_marked = [];
@@ -15273,18 +15167,14 @@ class DispatchDashboard {
                 // Save the order
                 $order->save();
 
-                // FIX v2.9.79: Temporarily delete suppression flag for INTENDED notification
-                // The flag was set to prevent duplicate notifications from save() hooks,
-                // but we need to allow the intended notification through
+                // FIX: Delete suppression flag BEFORE triggering notification
+                // When driver completes packing list, we WANT to send the SMS!
+                // Suppression flag is only needed during item-by-item packing
                 delete_transient('dispatch_suppress_notifications_' . $order_id);
-                error_log("✅ Suppression flag DELETED for order #{$order_id} - allowing intended notification");
+                error_log("✅ Suppression FLAG REMOVED for order #$order_id - SMS can now be sent");
 
-                // Trigger email AND SMS to customer with tracking link
+                // Trigger SMS/Email to customer (SMS is now allowed!)
                 do_action('dispatch_delivery_started_notification', $order_id, $order);
-
-                // Re-set suppression flag to prevent duplicate notifications from subsequent hooks
-                set_transient('dispatch_suppress_notifications_' . $order_id, true, 30);
-                error_log("🔒 Suppression flag RE-SET for order #{$order_id} - blocking duplicate notifications for 30 seconds");
 
                 // NOTE: Removed redundant save_meta_data() call here
                 // $order->save() already saved all meta data, and calling save_meta_data()
@@ -15484,7 +15374,6 @@ class DispatchDashboard {
     
     /**
      * AJAX: Get SumUp Credentials for current driver
-     * Returns affiliate_key and app_identifier for iOS/Android integration
      */
     public function ajaxGetSumUpCredentials(): void {
         Dispatch_Security::verify_driver_access(true);
@@ -15496,25 +15385,15 @@ class DispatchDashboard {
             return;
         }
 
-        // First check user-specific key, then fall back to global option
         $affiliate_key = get_user_meta($user_id, 'sumup_affiliate_key', true);
-
-        if (empty($affiliate_key)) {
-            // Fall back to global SumUp Affiliate Key from admin settings
-            $affiliate_key = get_option('dispatch_sumup_affiliate_key', '');
-        }
 
         if (empty($affiliate_key)) {
             wp_send_json_error(['message' => 'SumUp Affiliate Key nicht konfiguriert']);
             return;
         }
 
-        // Get App Identifier for Android (required for URL scheme)
-        $app_identifier = get_option('dispatch_sumup_app_identifier', '');
-
         wp_send_json_success([
-            'affiliate_key' => $affiliate_key,
-            'app_identifier' => $app_identifier
+            'affiliate_key' => $affiliate_key
         ]);
     }
 
@@ -15632,15 +15511,39 @@ class DispatchDashboard {
             }
         }
 
+        // v2.9.80: Check if order is already delivered - tell frontend to reload
+        $check_order = wc_get_order($order_id);
+        if ($check_order) {
+            $order_status = $check_order->get_status();
+            $delivered_at = $check_order->get_meta('_delivery_completed_date');
+
+            // If order is delivered/completed, signal frontend to show delivered state
+            if (in_array($order_status, ['delivered', 'completed']) || !empty($delivered_at)) {
+                wp_send_json_success([
+                    'order_delivered' => true,
+                    'delivered_at' => $delivered_at ?: current_time('mysql'),
+                    'message' => 'Bestellung wurde zugestellt'
+                ]);
+                return;
+            }
+        }
+
         // Try to get location from Traccar first, then fallback to user meta
         $use_traccar = get_option('dispatch_traccar_enabled', 0);
         $driver_lat = null;
         $driver_lng = null;
 
         if ($use_traccar) {
-            // Get Traccar device ID for this driver
-            $traccar_device_id = get_user_meta($driver_id, 'traccar_device_id', true);
-            $traccar_unique_id = get_user_meta($driver_id, 'traccar_unique_id', true);
+            // Get Traccar device ID for this driver - check BOTH meta keys for compatibility
+            // v2.9.82: QR generator uses _traccar_device_id, older code uses traccar_device_id
+            $traccar_device_id = get_user_meta($driver_id, '_traccar_device_id', true);
+            if (empty($traccar_device_id)) {
+                $traccar_device_id = get_user_meta($driver_id, 'traccar_device_id', true);
+            }
+            $traccar_unique_id = get_user_meta($driver_id, '_traccar_unique_id', true);
+            if (empty($traccar_unique_id)) {
+                $traccar_unique_id = get_user_meta($driver_id, 'traccar_unique_id', true);
+            }
 
             error_log("DEBUG ajaxGetDriverLocation: Driver $driver_id - device_id=$traccar_device_id, unique_id=$traccar_unique_id");
 
@@ -15878,601 +15781,11 @@ class DispatchDashboard {
         ]);
     }
 
-    /**
-     * Format phone number to E.164 format for Twilio/WhatsApp
-     * Supports Spanish, German, and other European phone numbers
-     *
-     * @param string $phone Raw phone number from order
-     * @param string $default_country_code Default country code (default: +34 for Spain)
-     * @return string Formatted phone number in E.164 format
-     */
-    private function formatPhoneNumberE164(string $phone, string $default_country_code = '+34'): string {
-        if (empty($phone)) {
-            return '';
-        }
 
-        // Remove all non-numeric characters except leading +
-        $phone = preg_replace('/[^\d+]/', '', $phone);
 
-        // Already in E.164 format with + prefix
-        if (strpos($phone, '+') === 0) {
-            return $phone;
-        }
 
-        // ========================================
-        // FIX: Handle international prefix 00 (e.g., 0049 for Germany, 0034 for Spain)
-        // 00 is the international call prefix used in many countries
-        // ========================================
-        if (strpos($phone, '00') === 0 && strlen($phone) > 4) {
-            // Remove leading 00 and add + prefix
-            $phone_without_00 = substr($phone, 2);
 
-            // Verify it starts with a valid country code
-            if (preg_match('/^(1|7|20|27|30|31|32|33|34|36|39|40|41|43|44|45|46|47|48|49|51|52|53|54|55|56|57|58|60|61|62|63|64|65|66|81|82|84|86|90|91|92|93|94|95|98|211|212|213|216|218|220|221|222|223|224|225|226|227|228|229|230|231|232|233|234|235|236|237|238|239|240|241|242|243|244|245|246|247|248|249|250|251|252|253|254|255|256|257|258|260|261|262|263|264|265|266|267|268|269|290|291|297|298|299|350|351|352|353|354|355|356|357|358|359|370|371|372|373|374|375|376|377|378|379|380|381|382|383|385|386|387|389|420|421|423|500|501|502|503|504|505|506|507|508|509|590|591|592|593|594|595|596|597|598|599|670|672|673|674|675|676|677|678|679|680|681|682|683|685|686|687|688|689|690|691|692|850|852|853|855|856|880|886|960|961|962|963|964|965|966|967|968|970|971|972|973|974|975|976|977|992|993|994|995|996|998)\d/', $phone_without_00)) {
-                error_log("Dispatch SMS: Converted 00-prefix number from '{$phone}' to '+{$phone_without_00}'");
-                return '+' . $phone_without_00;
-            }
-        }
 
-        // If it already starts with a country code (no +), add + prefix
-        // Common European country codes: 34 (ES), 49 (DE), 33 (FR), 39 (IT), 44 (UK), 43 (AT)
-        if (preg_match('/^(34|49|33|39|44|43|41|31|32|351|352|353|354|355|356|357|358|359|370|371|372|373|374|375|376|377|378|380|381|382|383|385|386|387|389|420|421|423)/', $phone)) {
-            return '+' . $phone;
-        }
-
-        // Save original for later
-        $original = $phone;
-
-        // Check if it starts with 0 (national format indicator for many countries)
-        $has_leading_zero = (strpos($phone, '0') === 0);
-
-        // Remove leading zero (used in national format but not in E.164)
-        $phone = ltrim($phone, '0');
-
-        // Length after removing leading zero
-        $length = strlen($phone);
-
-        // IF DEFAULT COUNTRY IS SPAIN AND NO LEADING ZERO: Check Spanish first
-        // Spanish national format NEVER has leading 0
-        if ($default_country_code === '+34' && !$has_leading_zero) {
-            // SPANISH NUMBERS (national format has NO leading 0)
-            // Mobile: 6xx xxx xxx or 7xx xxx xxx (9 digits)
-            if (preg_match('/^[67]\d{8}$/', $phone)) {
-                return '+34' . $phone;
-            }
-            // Landline: Various formats, typically 9 digits starting with 8 or 9
-            if (preg_match('/^[89]\d{8}$/', $phone)) {
-                return '+34' . $phone;
-            }
-        }
-
-        // NOTE: If there IS a leading zero, we do NOT check Spanish patterns here.
-        // Spanish numbers never have leading 0, so it must be UK/NL/DE/FR.
-        // However, users sometimes incorrectly add a 0 to Spanish numbers.
-        // In that case, we'll catch it in the fallback at the end.
-
-        // Strategy: Use TOTAL LENGTH of ORIGINAL number to distinguish between countries
-        // German landline: 11-12 digits with leading 0 (e.g., 030xxxxxxxx = 11 digits)
-        // Dutch landline: 10 digits with leading 0 (e.g., 020xxxxxxx = 10 digits)
-        // UK landline: 10-11 digits with leading 0
-        // UK mobile: 11 digits with leading 0
-
-        $original_length = strlen($original);
-
-        // NETHERLANDS (DUTCH) NUMBERS (check FIRST - 10 digits total)
-        if ($has_leading_zero && $original_length === 10) {
-            // Dutch mobile: 06xxxxxxxx (10 digits)
-            if (preg_match('/^06\d{8}$/', $original)) {
-                return '+31' . $phone;
-            }
-            // Dutch landline: 0xx yyyyyyy (10 digits total)
-            // Rotterdam 010, Amsterdam 020, Utrecht 030, Eindhoven 040, etc.
-            if (preg_match('/^0(10|20|23|24|26|30|33|35|36|38|40|43|45|46|50|53|55|58|70|71|72|73|74|75|76|77|78|79|13|15|161|162|164|165|166|167|168|172|174|180|181|182|183|184|186|187)\d{6,7}$/', $original)) {
-                return '+31' . $phone;
-            }
-        }
-
-        // UK NUMBERS (check BEFORE German - more specific patterns, 10-11 digits total)
-        if ($has_leading_zero && ($original_length === 10 || $original_length === 11)) {
-            // UK mobile: 07xxxxxxxxx (11 digits)
-            if ($original_length === 11 && preg_match('/^07[0-9]\d{8}$/', $original)) {
-                return '+44' . $phone;
-            }
-            // UK landline: 020xxxxxxxx (11 digits for London), 01xxx xxxxxx (10-11 digits)
-            // UK non-geographic: Specific 03xx codes (0300, 0303, 0330, 0333, etc.)
-            // Exclude 030x which could be German area codes
-            // Pattern: 020/028/029 or 01x or specific 03xx (but NOT 030, 040, 069, 089 which are German)
-            if (preg_match('/^0(20|28|29|1[1-9]\d{0,1}|3(00|03|30|33|43|44|45|70|71|72))\d+$/', $original)) {
-                return '+44' . $phone;
-            }
-        }
-
-        // GERMAN NUMBERS (check AFTER UK - 11-12 digits total)
-        if ($has_leading_zero && ($original_length >= 11 && $original_length <= 12)) {
-            // German mobile: 01[5-7]xxxxxxxxx (12 digits)
-            if (preg_match('/^01[5-7]\d{9}$/', $original)) {
-                return '+49' . $phone;
-            }
-            // German landline: 030xxxxxxxx, 040xxxxxxxx, etc. (11 digits typically)
-            // 2-digit area codes: 030, 040, 069, 089
-            // 3-digit area codes: 0201, 0211, 0221, 0228, 0231, etc.
-            if (preg_match('/^0(30|40|69|89|201|211|221|228|231|2[0-9]{2}|3[0-9]{2}|4[0-9]{2}|5[0-9]{2}|6[0-9]{2}|7[0-9]{2}|8[0-9]{2}|9[0-9]{2})\d{6,8}$/', $original)) {
-                return '+49' . $phone;
-            }
-        }
-
-        // FRENCH NUMBERS
-        if ($has_leading_zero && $length === 9) {
-            // French mobile/landline: 0x xx xx xx xx (10 digits with 0, 9 without)
-            if (preg_match('/^[1-9]\d{8}$/', $phone)) {
-                return '+33' . $phone;
-            }
-        }
-
-        // SPANISH NUMBERS (if not checked above)
-        // Only match if there was NO leading zero
-        if (!$has_leading_zero) {
-            // Mobile: 6xx xxx xxx or 7xx xxx xxx (9 digits)
-            if (preg_match('/^[67]\d{8}$/', $phone)) {
-                return '+34' . $phone;
-            }
-            // Landline: Various formats, typically 9 digits starting with 8 or 9
-            if (preg_match('/^[89]\d{8}$/', $phone)) {
-                return '+34' . $phone;
-            }
-        }
-
-        // Special fallback for Spanish numbers entered with wrong leading 0
-        // This catches patterns that clearly look Spanish but had a 0 prefix
-        // Only check patterns that DON'T conflict with other countries:
-        // - 08xxx or 09xxx (Spanish landline) - doesn't conflict with UK/NL/DE
-        if ($default_country_code === '+34' && $has_leading_zero) {
-            if (preg_match('/^[89]\d{8}$/', $phone)) {
-                // This is very likely a Spanish landline entered with wrong leading 0
-                // (08xxxxxxxx or 09xxxxxxxx doesn't match UK/NL/DE patterns)
-                return '+34' . $phone;
-            }
-        }
-
-        // If nothing matched and we removed a leading zero, try default country code
-        if ($original !== $phone) {
-            return $default_country_code . $phone;
-        }
-
-        // Last resort: prepend default country code to original
-        return $default_country_code . $original;
-    }
-
-    /**
-     * Convert German umlauts to ASCII for SMS (GSM-7 encoding compatibility)
-     *
-     * @param string $text Text with umlauts
-     * @return string Text with umlauts converted to ASCII
-     */
-    private function convertUmlautsForSMS(string $text): string {
-        $replacements = [
-            'ä' => 'ae',
-            'ö' => 'oe',
-            'ü' => 'ue',
-            'ß' => 'ss',
-            'Ä' => 'Ae',
-            'Ö' => 'Oe',
-            'Ü' => 'Ue',
-        ];
-
-        return str_replace(array_keys($replacements), array_values($replacements), $text);
-    }
-
-    /**
-     * Replace placeholders in SMS templates
-     *
-     * @param string $template SMS template with placeholders
-     * @param array $data Placeholder data
-     * @return string SMS text with replaced placeholders
-     */
-    private function replaceSMSPlaceholders(string $template, array $data): string {
-        // Convert umlauts in company name for SMS compatibility
-        $company_name = $this->convertUmlautsForSMS($data['company_name'] ?? get_bloginfo('name'));
-
-        $placeholders = [
-            '{customer_name}' => $data['customer_name'] ?? '',
-            '{driver_name}' => $data['driver_name'] ?? '',
-            '{order_number}' => $data['order_number'] ?? '',
-            '{tracking_url}' => $data['tracking_url'] ?? '',
-            '{delivery_time}' => $data['delivery_time'] ?? '',
-            '{company_name}' => $company_name,
-        ];
-
-        $text = str_replace(array_keys($placeholders), array_values($placeholders), $template);
-
-        // Convert all remaining umlauts in the final text (for safety)
-        return $this->convertUmlautsForSMS($text);
-    }
-
-    /**
-     * Send delivery started notification to customer (SMS/WhatsApp with tracking link)
-     */
-    public function sendDeliveryStartedNotification($order_id, $order): void {
-        $settings = $this->getSettings();
-
-        // Check if driver dispatched notification is enabled
-        if ($settings['notify_driver_dispatched'] !== 'yes') {
-            error_log('Dispatch: Driver dispatched notification disabled in settings');
-            return;
-        }
-
-        // Check suppression flag - ONLY for SMS, not emails
-        $suppress_sms = get_transient('dispatch_suppress_notifications_' . $order_id);
-        if ($suppress_sms) {
-            error_log("🚫 SMS/WhatsApp SUPPRESSED for order #$order_id - flag is active");
-            return;
-        }
-
-        // NOTE: WooCommerce Email class now handles the email sending
-        // This function now only handles SMS/WhatsApp notifications
-        error_log("Dispatch: Sending SMS/WhatsApp notifications for order #{$order_id}");
-
-        // Get customer info
-        $customer_name = $order->get_billing_first_name();
-        $raw_phone = $order->get_billing_phone();
-        $customer_phone = $this->formatPhoneNumberE164($raw_phone);
-
-        // Log phone number formatting for debugging
-        if ($raw_phone !== $customer_phone) {
-            error_log("Dispatch SMS: Phone formatted from '{$raw_phone}' to '{$customer_phone}' (E.164)");
-        }
-
-        // Get driver info
-        $driver_id = $order->get_meta('_assigned_driver');
-        $driver = $driver_id ? get_userdata($driver_id) : null;
-        $driver_name = $driver ? $driver->display_name : 'Ihr Fahrer';
-
-        // Get tracking URL
-        $tracking_url = home_url('/tracking/' . $order_id . '/' . $order->get_order_key() . '/');
-
-        // Get ETA
-        $delivery_time = $order->get_meta('Gewünschtes Zeitfenster - unverbindlich') ?: $order->get_meta('_orddd_time_slot') ?: 'swm';
-
-        // Normalize long delivery time descriptions to "swm" (space saving)
-        if (!empty($delivery_time)) {
-            $delivery_time_lower = strtolower($delivery_time);
-            if (in_array($delivery_time_lower, ['schnellstmöglich', 'so schnell wie möglich', 'asap'])) {
-                $delivery_time = 'swm';
-            }
-        }
-
-        // Send WhatsApp if enabled
-        if ($settings['enable_whatsapp_notifications'] === 'yes' && !empty($settings['whatsapp_access_token'])) {
-            $whatsapp_message = "🚚 Gute Nachrichten!\n\n";
-            $whatsapp_message .= "Hallo {$customer_name},\n\n";
-            $whatsapp_message .= "{$driver_name} ist jetzt unterwegs zu Ihnen!\n\n";
-            $whatsapp_message .= "📦 Bestellung: #{$order->get_order_number()}\n";
-            $whatsapp_message .= "⏰ Voraussichtliche Ankunft: {$delivery_time}\n\n";
-            $whatsapp_message .= "📍 Verfolgen Sie Ihre Lieferung live:\n";
-            $whatsapp_message .= $tracking_url;
-
-            $this->sendWhatsAppMessage($customer_phone, $whatsapp_message, $settings);
-            error_log("Dispatch: WhatsApp notification sent to {$customer_phone} for order #{$order->get_order_number()}");
-        }
-
-        // Send SMS if enabled (check both global SMS setting AND this specific SMS type)
-        $sms_type_enabled = ($settings['sms_delivery_started_enabled'] ?? 'yes') === 'yes';
-
-        if ($settings['enable_sms_notifications'] === 'yes' && !empty($settings['twilio_account_sid']) && $sms_type_enabled) {
-            error_log("Dispatch SMS: Attempting to send SMS to {$customer_phone} for order #{$order->get_order_number()}");
-
-            // Use custom SMS template or fall back to default
-            $sms_template = !empty($settings['sms_delivery_started_template'])
-                ? $settings['sms_delivery_started_template']
-                : "🚚 {driver_name} ist unterwegs zu Ihnen!\n\nBestellung #{order_number}\nVoraussichtliche Lieferzeit: {delivery_time}\n\nTracking: {tracking_url}";
-
-            $sms_message = $this->replaceSMSPlaceholders($sms_template, [
-                'customer_name' => $customer_name,
-                'driver_name' => $driver_name,
-                'order_number' => $order->get_order_number(),
-                'tracking_url' => $tracking_url,
-                'delivery_time' => $delivery_time,
-                'company_name' => get_bloginfo('name'),
-            ]);
-
-            $result = $this->sendSMSViaTwilio(
-                $settings['twilio_account_sid'],
-                $settings['twilio_auth_token'],
-                $settings['twilio_phone_number'],
-                $customer_phone,
-                $sms_message
-            );
-
-            if ($result['success']) {
-                error_log("Dispatch SMS: ✅ SMS successfully sent to {$customer_phone} for order #{$order->get_order_number()}");
-                // FIX v2.9.79: Add order note for sent SMS
-                $order->add_order_note(sprintf(
-                    '📱 SMS "Fahrer unterwegs" gesendet an %s',
-                    $customer_phone
-                ));
-            } else {
-                error_log("Dispatch SMS: ❌ SMS failed for order #{$order->get_order_number()}: " . $result['error']);
-                // FIX v2.9.79: Add order note for failed SMS
-                $order->add_order_note(sprintf(
-                    '❌ SMS-Versand fehlgeschlagen: %s (Nummer: %s)',
-                    $result['error'],
-                    $customer_phone
-                ));
-            }
-        } else {
-            // Log why SMS was not sent
-            $skip_reason = '';
-            if ($settings['enable_sms_notifications'] !== 'yes') {
-                error_log("Dispatch SMS: Skipped - SMS notifications disabled in settings");
-                $skip_reason = 'SMS deaktiviert';
-            } elseif (empty($settings['twilio_account_sid'])) {
-                error_log("Dispatch SMS: Skipped - Twilio Account SID not configured");
-                $skip_reason = 'Twilio nicht konfiguriert';
-            } elseif (!$sms_type_enabled) {
-                error_log("Dispatch SMS: Skipped - 'Fahrer unterwegs' SMS is disabled");
-                $skip_reason = '"Fahrer unterwegs" SMS deaktiviert';
-            }
-            // FIX v2.9.79: Add order note when SMS is skipped (only if there's a reason)
-            if (!empty($skip_reason)) {
-                $order->add_order_note(sprintf('ℹ️ SMS übersprungen: %s', $skip_reason));
-            }
-        }
-
-        // FIX v2.9.79: Note that WooCommerce Email was triggered
-        $order->add_order_note('📧 "Fahrer unterwegs" Email wurde getriggert');
-    }
-
-    /**
-     * Send "Driver Nearby" notification to customer (SMS/WhatsApp)
-     * Triggered automatically when driver is within the configured time window
-     *
-     * @param int $order_id Order ID
-     * @param WC_Order $order Order object
-     */
-    private function sendDriverNearbyNotification($order_id, $order): void {
-        $settings = $this->getSettings();
-
-        // Double-check if driver nearby SMS is enabled
-        $sms_type_enabled = ($settings['sms_driver_nearby_enabled'] ?? 'no') === 'yes';
-
-        if (!$sms_type_enabled) {
-            error_log("Dispatch: Driver nearby SMS disabled for order #{$order_id}");
-            return;
-        }
-
-        // Check suppression flag - ONLY for SMS, not emails
-        $suppress_sms = get_transient('dispatch_suppress_notifications_' . $order_id);
-        if ($suppress_sms) {
-            error_log("🚫 'Driver Nearby' SMS/WhatsApp SUPPRESSED for order #$order_id - flag is active");
-            return;
-        }
-
-        error_log("Dispatch: Sending 'Driver Nearby' SMS/WhatsApp for order #{$order_id}");
-
-        // Get customer info
-        $customer_name = $order->get_billing_first_name();
-        $raw_phone = $order->get_billing_phone();
-        $customer_phone = $this->formatPhoneNumberE164($raw_phone);
-
-        if (empty($customer_phone)) {
-            error_log("Dispatch: No phone number for order #{$order_id}");
-            return;
-        }
-
-        // Log phone number formatting
-        if ($raw_phone !== $customer_phone) {
-            error_log("Dispatch SMS: Phone formatted from '{$raw_phone}' to '{$customer_phone}' (E.164)");
-        }
-
-        // Get driver info
-        $driver_id = $order->get_meta('_assigned_driver');
-        $driver = $driver_id ? get_userdata($driver_id) : null;
-        $driver_name = $driver ? $driver->display_name : 'Ihr Fahrer';
-
-        // Get tracking URL
-        $tracking_url = home_url('/tracking/' . $order_id . '/' . $order->get_order_key() . '/');
-
-        // Send WhatsApp if enabled
-        if ($settings['enable_whatsapp_notifications'] === 'yes' && !empty($settings['whatsapp_access_token'])) {
-            $whatsapp_template = $settings['sms_driver_nearby_template'] ?? "📍 {driver_name} ist in Ihrer Nähe und wird in wenigen Minuten bei Ihnen sein!\n\nBestellung #{order_number}";
-
-            $whatsapp_message = $this->replaceSMSPlaceholders($whatsapp_template, [
-                'customer_name' => $customer_name,
-                'driver_name' => $driver_name,
-                'order_number' => $order->get_order_number(),
-                'tracking_url' => $tracking_url,
-                'delivery_time' => '',
-                'company_name' => get_bloginfo('name'),
-            ]);
-
-            $this->sendWhatsAppMessage($customer_phone, $whatsapp_message, $settings);
-            error_log("Dispatch: WhatsApp 'Driver Nearby' sent to {$customer_phone} for order #{$order->get_order_number()}");
-        }
-
-        // Send SMS if enabled
-        if ($settings['enable_sms_notifications'] === 'yes' && !empty($settings['twilio_account_sid']) && $sms_type_enabled) {
-            error_log("Dispatch SMS: Sending 'Driver Nearby' SMS to {$customer_phone} for order #{$order->get_order_number()}");
-
-            // Use custom SMS template or fall back to default
-            $sms_template = !empty($settings['sms_driver_nearby_template'])
-                ? $settings['sms_driver_nearby_template']
-                : "📍 {driver_name} ist in Ihrer Nähe und wird in wenigen Minuten bei Ihnen sein!\n\nBestellung #{order_number}";
-
-            $sms_message = $this->replaceSMSPlaceholders($sms_template, [
-                'customer_name' => $customer_name,
-                'driver_name' => $driver_name,
-                'order_number' => $order->get_order_number(),
-                'tracking_url' => $tracking_url,
-                'delivery_time' => '',
-                'company_name' => get_bloginfo('name'),
-            ]);
-
-            $result = $this->sendSMSViaTwilio(
-                $settings['twilio_account_sid'],
-                $settings['twilio_auth_token'],
-                $settings['twilio_phone_number'],
-                $customer_phone,
-                $sms_message
-            );
-
-            if ($result['success']) {
-                error_log("Dispatch SMS: ✅ 'Driver Nearby' SMS sent to {$customer_phone} for order #{$order->get_order_number()}");
-            } else {
-                error_log("Dispatch SMS: ❌ 'Driver Nearby' SMS failed for order #{$order->get_order_number()}: " . $result['error']);
-            }
-        } else {
-            // Log why SMS was not sent
-            if ($settings['enable_sms_notifications'] !== 'yes') {
-                error_log("Dispatch SMS: Skipped - SMS notifications disabled");
-            } elseif (empty($settings['twilio_account_sid'])) {
-                error_log("Dispatch SMS: Skipped - Twilio not configured");
-            } elseif (!$sms_type_enabled) {
-                error_log("Dispatch SMS: Skipped - 'Driver Nearby' SMS disabled");
-            }
-        }
-    }
-
-    /**
-     * Check if driver is near any customers and send notifications
-     * Called on GPS location update from driver app
-     *
-     * @param int $driver_id Driver user ID
-     * @param float $driver_lat Driver's current latitude
-     * @param float $driver_lng Driver's current longitude
-     */
-    private function checkDriverNearbyNotifications($driver_id, $driver_lat, $driver_lng): void {
-        $settings = $this->getSettings();
-
-        // Check if driver nearby notifications are enabled
-        $sms_enabled = ($settings['sms_driver_nearby_enabled'] ?? 'no') === 'yes';
-        $whatsapp_enabled = ($settings['enable_whatsapp_notifications'] ?? 'no') === 'yes';
-
-        if (!$sms_enabled && !$whatsapp_enabled) {
-            return; // No notifications enabled, skip processing
-        }
-
-        // Get timing threshold (default 30 minutes)
-        $timing_threshold = intval($settings['sms_notification_timing'] ?? 30);
-
-        // Get all active orders for this driver
-        // Status: Processing (geladen), Fahrer unterwegs, Out for Delivery
-        $args = [
-            'status' => ['wc-processing', 'wc-fahrer-unterwegs', 'wc-out-for-delivery'],
-            'meta_key' => '_assigned_driver',
-            'meta_value' => $driver_id,
-            'limit' => -1,
-        ];
-
-        $orders = wc_get_orders($args);
-
-        if (empty($orders)) {
-            return; // No active orders for this driver
-        }
-
-        foreach ($orders as $order) {
-            // Check if SMS already sent for this order
-            if ($order->get_meta('_driver_nearby_sms_sent')) {
-                continue; // Already sent, skip
-            }
-
-            // For processing orders, ensure they are marked as "ready" (geladen)
-            if ($order->get_status() === 'processing') {
-                if ($order->get_meta('_order_ready') !== 'yes') {
-                    continue; // Not ready for delivery yet, skip
-                }
-            }
-
-            // Get customer coordinates (3-tier priority)
-            // Priority 1: LPAC coordinates
-            $customer_lat = floatval($order->get_meta('lpac_latitude'));
-            $customer_lng = floatval($order->get_meta('lpac_longitude'));
-
-            // Priority 2: Shipping coordinates
-            if (!$customer_lat || !$customer_lng) {
-                $customer_lat = floatval($order->get_meta('_shipping_latitude'));
-                $customer_lng = floatval($order->get_meta('_shipping_longitude'));
-            }
-
-            // Priority 3: Billing coordinates
-            if (!$customer_lat || !$customer_lng) {
-                $customer_lat = floatval($order->get_meta('_billing_latitude'));
-                $customer_lng = floatval($order->get_meta('_billing_longitude'));
-            }
-
-            if (!$customer_lat || !$customer_lng) {
-                error_log("Dispatch: Order #{$order->get_id()} has no coordinates, skipping driver nearby check");
-                continue;
-            }
-
-            // ✅ FIX v2.9.62: Dynamic Luftlinie-Vorfilter based on timing threshold
-            // Calculate max acceptable straight-line distance based on timing threshold
-            // Formula: (timing_threshold_min × 30 km/h) / 1.4 routing_factor = max_luftlinie_km
-            // Example: 30 min × 30 km/h = 15 km driving → ~11 km straight-line
-            $average_speed_kmh = 30;
-            $routing_factor = 1.4; // Road distance is typically 1.4x straight-line
-            $max_luftlinie_km = ($timing_threshold / 60) * $average_speed_kmh / $routing_factor;
-
-            $luftlinie_km = $this->calculateDistance($driver_lat, $driver_lng, $customer_lat, $customer_lng);
-
-            if ($luftlinie_km > $max_luftlinie_km) {
-                // Driver definitely too far away - skip Google API to save costs
-                error_log("Dispatch: Order #{$order->get_id()} - Driver too far away (luftlinie: " . round($luftlinie_km, 2) . " km > " . round($max_luftlinie_km, 2) . " km threshold for {$timing_threshold} min), skipping Google API");
-
-                // ✅ MONITORING: Track skipped API call (saved money!)
-                $this->trackGoogleApiCall('luftlinie_filter_skip', false);
-
-                continue;
-            }
-
-            error_log("Dispatch: Order #{$order->get_id()} - Driver within " . round($max_luftlinie_km, 2) . " km luftlinie (" . round($luftlinie_km, 2) . " km), checking real driving distance...");
-
-            // ✅ OPTIMIZATION 2: Mit Caching - siehe calculateDrivingDistance()
-            // Fahrer ist nah genug - jetzt Google API für genaue Berechnung
-            $routing_data = $this->calculateDrivingDistance($driver_lat, $driver_lng, $customer_lat, $customer_lng, $order->get_id());
-
-            if ($routing_data && $routing_data['status'] === 'OK') {
-                // Use real driving distance and traffic-aware ETA from Google
-                $distance_km = $routing_data['distance_km'];
-                $eta_minutes = $routing_data['duration_minutes'];
-                $calculation_method = 'google_directions_api';
-
-                error_log("Dispatch: Order #{$order->get_id()} - REAL driving distance: " . round($distance_km, 2) . " km, ETA with traffic: {$eta_minutes} min (threshold: {$timing_threshold} min)");
-            } else {
-                // Fallback to straight-line distance if Google API fails
-                error_log("Dispatch: Google Directions API unavailable for order #{$order->get_id()}, using fallback calculation");
-
-                $distance_km = $this->calculateDistance($driver_lat, $driver_lng, $customer_lat, $customer_lng);
-
-                // Fallback ETA calculation (straight-line distance + buffer)
-                // Average speed in city: 30 km/h (conservative estimate)
-                // Add 40% extra time for actual road routing and traffic (instead of 20%)
-                $average_speed_kmh = 30;
-                $traffic_factor = 1.4; // Increased from 1.2 to account for routing
-                $eta_minutes = round(($distance_km / $average_speed_kmh) * 60 * $traffic_factor);
-                $calculation_method = 'haversine_fallback';
-
-                error_log("Dispatch: Order #{$order->get_id()} - FALLBACK straight-line distance: " . round($distance_km, 2) . " km, estimated ETA: {$eta_minutes} min");
-            }
-
-            // If ETA is within threshold and greater than 0, send notification
-            if ($eta_minutes > 0 && $eta_minutes <= $timing_threshold) {
-                error_log("Dispatch: 🚨 Driver is near order #{$order->get_id()}! Sending 'Driver Nearby' notification...");
-
-                // Send the notification
-                $this->sendDriverNearbyNotification($order->get_id(), $order);
-
-                // Mark as sent to prevent duplicate notifications
-                $order->update_meta_data('_driver_nearby_sms_sent', 'yes');
-                $order->update_meta_data('_driver_nearby_sms_sent_at', current_time('mysql'));
-                $order->update_meta_data('_driver_nearby_distance_km', round($distance_km, 2));
-                $order->update_meta_data('_driver_nearby_eta_minutes', $eta_minutes);
-                $order->update_meta_data('_driver_nearby_calculation_method', $calculation_method);
-                $order->save();
-
-                error_log("Dispatch: ✅ 'Driver Nearby' notification sent for order #{$order->get_id()} (ETA: {$eta_minutes} min, Distance: " . round($distance_km, 2) . " km, Method: {$calculation_method})");
-            }
-        }
-    }
 
     /**
      * Schedule Traccar SMS Check (5-minute cron job)
@@ -16519,16 +15832,19 @@ class DispatchDashboard {
         // Get all drivers
         $drivers = get_users([
             'role' => 'lieferfahrer',
-            'fields' => 'ID'  // Returns array of IDs as integers
+            'fields' => ['ID']
         ]);
 
         $checked_count = 0;
 
-        foreach ($drivers as $driver_id) {
-            // $driver_id is now directly the ID (integer)
+        foreach ($drivers as $driver) {
+            $driver_id = $driver->ID;
 
-            // Check if driver has Traccar device
-            $traccar_device_id = get_user_meta($driver_id, 'traccar_device_id', true);
+            // Check if driver has Traccar device - check BOTH meta keys (v2.9.82)
+            $traccar_device_id = get_user_meta($driver_id, '_traccar_device_id', true);
+            if (empty($traccar_device_id)) {
+                $traccar_device_id = get_user_meta($driver_id, 'traccar_device_id', true);
+            }
             if (!$traccar_device_id) {
                 continue;
             }
@@ -16578,56 +15894,670 @@ class DispatchDashboard {
     }
 
     /**
-     * Send WhatsApp message via WhatsApp Business API
+     * Check if driver is near customers and send SMS notifications
+     * v2.9.79: CUMULATIVE ETA - Considers delivery sequence!
+     *
+     * Example:
+     * - Customer 1: Direct ETA = 25 min → SMS sent at 30 min threshold
+     * - Customer 2: ETA to C1 (25) + stop (10) + travel C1→C2 (10) = 45 min → No SMS yet
+     * - Customer 3: 45 + stop (10) + travel C2→C3 (8) = 63 min → No SMS yet
      */
-    private function sendWhatsAppMessage($to_phone, $message, $settings): bool {
-        if (empty($settings['whatsapp_access_token']) || empty($settings['whatsapp_phone_number_id'])) {
-            error_log('Dispatch WhatsApp: Missing access token or phone number ID');
-            return false;
+    private function checkDriverNearbyNotifications($driver_id, $driver_lat, $driver_lng): void {
+        // Check if SMS notifications are enabled
+        $sms_enabled = get_option('dispatch_enable_sms_notifications') === 'yes';
+        $nearby_sms_enabled = get_option('dispatch_sms_driver_nearby_enabled') === 'yes';
+
+        if (!$sms_enabled || !$nearby_sms_enabled) {
+            return;
         }
 
-        // Format phone number (remove spaces, dashes, etc.)
-        $to_phone = preg_replace('/[^0-9+]/', '', $to_phone);
+        // Get notification timing threshold (default 30 minutes)
+        $eta_threshold = intval(get_option('dispatch_sms_notification_timing', 30));
 
-        // Add country code if missing
-        if (!str_starts_with($to_phone, '+')) {
-            $to_phone = '+' . $to_phone;
+        // Get average stop duration at each customer (default 10 minutes)
+        $stop_duration = intval(get_option('dispatch_average_stop_duration', 10));
+
+        // Get all orders assigned to this driver that are "geladen" (ready/loaded)
+        $orders = wc_get_orders([
+            'limit' => -1,
+            'meta_query' => [
+                'relation' => 'AND',
+                [
+                    'key' => '_assigned_driver',
+                    'value' => $driver_id,
+                    'compare' => '='
+                ],
+                [
+                    'key' => '_order_ready',
+                    'value' => 'yes',
+                    'compare' => '='
+                ]
+            ],
+            'status' => ['processing', 'on-hold']
+        ]);
+
+        if (empty($orders)) {
+            return;
         }
 
-        $url = 'https://graph.facebook.com/v18.0/' . $settings['whatsapp_phone_number_id'] . '/messages';
+        error_log("DRIVER NEARBY CHECK v2.9.79: Driver #$driver_id has " . count($orders) . " loaded orders (stop duration: {$stop_duration}min)");
 
-        $data = [
-            'messaging_product' => 'whatsapp',
-            'to' => $to_phone,
-            'type' => 'text',
-            'text' => [
-                'body' => $message
-            ]
-        ];
+        // Step 1: Collect orders with coordinates and delivery sequence
+        $pending_orders = [];
+        foreach ($orders as $order) {
+            $order_id = $order->get_id();
+
+            // Skip if already delivered
+            if ($order->get_meta('_delivery_completed_date')) {
+                continue;
+            }
+
+            // Get customer coordinates (3-tier priority)
+            $customer_lat = $order->get_meta('lpac_latitude');
+            $customer_lng = $order->get_meta('lpac_longitude');
+
+            if (empty($customer_lat) || empty($customer_lng)) {
+                $customer_lat = $order->get_meta('_shipping_latitude');
+                $customer_lng = $order->get_meta('_shipping_longitude');
+            }
+
+            if (empty($customer_lat) || empty($customer_lng)) {
+                $customer_lat = $order->get_meta('billing_latitude');
+                $customer_lng = $order->get_meta('billing_longitude');
+            }
+
+            if (empty($customer_lat) || empty($customer_lng)) {
+                error_log("DRIVER NEARBY CHECK: Order #$order_id has no coordinates - skipping");
+                continue;
+            }
+
+            // Get delivery sequence (used by routing page)
+            $sequence = intval($order->get_meta('_delivery_sequence'));
+            if (!$sequence) {
+                $sequence = 999; // Unsequenced orders go last
+            }
+
+            $pending_orders[] = [
+                'order' => $order,
+                'order_id' => $order_id,
+                'sequence' => $sequence,
+                'lat' => floatval($customer_lat),
+                'lng' => floatval($customer_lng),
+                'sms_sent' => $order->get_meta('_driver_nearby_sms_sent') === 'yes'
+            ];
+        }
+
+        if (empty($pending_orders)) {
+            return;
+        }
+
+        // Step 2: Sort by delivery sequence
+        usort($pending_orders, function($a, $b) {
+            return $a['sequence'] - $b['sequence'];
+        });
+
+        error_log("DRIVER NEARBY CHECK: Sorted " . count($pending_orders) . " orders by sequence");
+
+        // Step 3: Calculate CUMULATIVE ETA for each order in delivery sequence
+        $cumulative_eta = 0;
+        $prev_lat = $driver_lat;
+        $prev_lng = $driver_lng;
+
+        foreach ($pending_orders as $index => $item) {
+            $order = $item['order'];
+            $order_id = $item['order_id'];
+            $customer_lat = $item['lat'];
+            $customer_lng = $item['lng'];
+
+            // Calculate travel time from previous position to this customer
+            $travel_time = $this->calculateRealisticETA($prev_lat, $prev_lng, $customer_lat, $customer_lng);
+
+            // Add travel time to cumulative ETA
+            $cumulative_eta += $travel_time;
+
+            $position = $index + 1;
+            error_log("DRIVER NEARBY CHECK: Order #$order_id (Position $position, Seq {$item['sequence']}) - Travel: {$travel_time}min, Cumulative ETA: {$cumulative_eta}min (threshold: {$eta_threshold}min)");
+
+            // Check if SMS should be sent:
+            // 1. Not already sent
+            // 2. ETA within threshold
+            // 3. ETA > 0 (valid coordinates)
+            // 4. Customer is NEXT STOP (index === 0) - don't notify if other stops are before them
+            if (!$item['sms_sent'] && $cumulative_eta <= $eta_threshold && $cumulative_eta > 0 && $index === 0) {
+                error_log("DRIVER NEARBY SMS: Order #$order_id - Cumulative ETA {$cumulative_eta}min within threshold AND is NEXT STOP - SENDING SMS");
+
+                // Send SMS notification with cumulative ETA
+                $this->sendDriverNearbySMS($order, $driver_id, $cumulative_eta);
+
+                // Mark as sent to prevent duplicates
+                $order->update_meta_data('_driver_nearby_sms_sent', 'yes');
+                $order->update_meta_data('_driver_nearby_sms_sent_at', current_time('mysql'));
+                $order->update_meta_data('_driver_nearby_eta_minutes', $cumulative_eta);
+                $order->update_meta_data('_driver_nearby_delivery_position', $position);
+                $order->save();
+            } elseif ($item['sms_sent']) {
+                error_log("DRIVER NEARBY CHECK: Order #$order_id - SMS already sent, skipping");
+            } elseif ($index > 0) {
+                error_log("DRIVER NEARBY CHECK: Order #$order_id - Position $position (not next stop) - waiting until customer is next");
+            } else {
+                error_log("DRIVER NEARBY CHECK: Order #$order_id - Cumulative ETA {$cumulative_eta}min > threshold {$eta_threshold}min - NOT sending SMS yet");
+            }
+
+            // Update previous position for next iteration
+            $prev_lat = $customer_lat;
+            $prev_lng = $customer_lng;
+
+            // Add stop duration for the next customer's calculation
+            // (time spent delivering to this customer before going to the next)
+            $cumulative_eta += $stop_duration;
+        }
+    }
+
+    /**
+     * Calculate realistic ETA using OSRM routing
+     *
+     * @param float $from_lat Start latitude
+     * @param float $from_lng Start longitude
+     * @param float $to_lat End latitude
+     * @param float $to_lng End longitude
+     * @return int ETA in minutes
+     */
+    private function calculateRealisticETA($from_lat, $from_lng, $to_lat, $to_lng): int {
+        // Try OSRM first for realistic driving time
+        $osrm_url = "https://router.project-osrm.org/route/v1/driving/{$from_lng},{$from_lat};{$to_lng},{$to_lat}?overview=false";
+
+        $response = wp_remote_get($osrm_url, ['timeout' => 5]);
+
+        if (!is_wp_error($response) && wp_remote_retrieve_response_code($response) === 200) {
+            $data = json_decode(wp_remote_retrieve_body($response), true);
+
+            if (isset($data['routes'][0]['duration'])) {
+                // OSRM returns duration in seconds, convert to minutes
+                $eta_minutes = ceil($data['routes'][0]['duration'] / 60);
+                error_log("OSRM ETA: $eta_minutes minutes (from $from_lat,$from_lng to $to_lat,$to_lng)");
+                return $eta_minutes;
+            }
+        }
+
+        // Fallback: Calculate based on straight-line distance and average speed
+        $distance_km = $this->calculateHaversineDistance($from_lat, $from_lng, $to_lat, $to_lng);
+        $avg_speed_kmh = 30; // Average city driving speed
+        $eta_minutes = ceil(($distance_km / $avg_speed_kmh) * 60);
+
+        error_log("FALLBACK ETA: $eta_minutes minutes (distance: $distance_km km at $avg_speed_kmh km/h)");
+        return $eta_minutes;
+    }
+
+    /**
+     * Calculate Haversine distance between two coordinates
+     */
+    private function calculateHaversineDistance($lat1, $lng1, $lat2, $lng2): float {
+        $earth_radius = 6371; // km
+
+        $lat1_rad = deg2rad($lat1);
+        $lat2_rad = deg2rad($lat2);
+        $delta_lat = deg2rad($lat2 - $lat1);
+        $delta_lng = deg2rad($lng2 - $lng1);
+
+        $a = sin($delta_lat / 2) ** 2 + cos($lat1_rad) * cos($lat2_rad) * sin($delta_lng / 2) ** 2;
+        $c = 2 * atan2(sqrt($a), sqrt(1 - $a));
+
+        return $earth_radius * $c;
+    }
+
+    /**
+     * Send "Driver Nearby" SMS to customer
+     */
+    private function sendDriverNearbySMS($order, $driver_id, $eta_minutes): void {
+        // Get Twilio credentials
+        $account_sid = get_option('dispatch_twilio_account_sid');
+        $auth_token = get_option('dispatch_twilio_auth_token');
+        $from_number = get_option('dispatch_twilio_phone_number');
+
+        if (empty($account_sid) || empty($auth_token) || empty($from_number)) {
+            error_log("DRIVER NEARBY SMS: Twilio not configured - skipping SMS");
+            return;
+        }
+
+        // Get customer phone number
+        $customer_phone = $order->get_billing_phone();
+        if (empty($customer_phone)) {
+            error_log("DRIVER NEARBY SMS: No customer phone for order #{$order->get_id()}");
+            return;
+        }
+
+        // Format phone number to E.164
+        $formatted_phone = $this->formatPhoneNumberE164($customer_phone);
+        if (!$formatted_phone) {
+            error_log("DRIVER NEARBY SMS: Invalid phone format: $customer_phone");
+            return;
+        }
+
+        // Get driver name
+        $driver = get_userdata($driver_id);
+        $driver_name = $driver ? $driver->display_name : 'Ihr Fahrer';
+
+        // Get SMS template - v2.9.79: Updated for cumulative ETA
+        // Template works for all customers in delivery sequence
+        $template = get_option('dispatch_sms_driver_nearby_template',
+            "🚚 {driver_name} ist unterwegs zu Ihnen!\n\n📍 Voraussichtliche Ankunft: ca. {eta_minutes} Minuten\n\nBestellung #{order_number}\n{company_name}");
+
+        // Build tracking URL
+        $tracking_token = $order->get_meta('_tracking_token');
+        $tracking_url = '';
+        if ($tracking_token) {
+            $tracking_url = get_site_url() . '/tracking/' . $order->get_id() . '/' . $tracking_token;
+        }
+
+        // Calculate delivery time (WordPress time + ETA) - v2.9.82
+        $delivery_time = date('H:i', current_time('timestamp') + ($eta_minutes * 60));
+
+        // Replace ALL placeholders (v2.9.82)
+        $message = str_replace([
+            '{driver_name}',
+            '{order_number}',
+            '{eta_minutes}',
+            '{customer_name}',
+            '{company_name}',
+            '{delivery_time}',
+            '{tracking_url}'
+        ], [
+            $driver_name,
+            '#' . $order->get_order_number(),
+            $eta_minutes,
+            $order->get_billing_first_name(),
+            get_option('dispatch_default_depot_name', get_bloginfo('name')),
+            $delivery_time,
+            $tracking_url
+        ], $template);
+
+        // Convert umlauts for SMS (GSM-7 compatibility)
+        $message = $this->convertUmlautsForSMS($message);
+
+        // Send SMS
+        $result = $this->sendSMSViaTwilio($account_sid, $auth_token, $from_number, $formatted_phone, $message);
+
+        if ($result['success']) {
+            error_log("DRIVER NEARBY SMS: Sent to $formatted_phone for order #{$order->get_id()} (ETA: $eta_minutes min)");
+            $order->add_order_note("📍 SMS 'Fahrer in der Nähe' gesendet (ETA: $eta_minutes Min.)");
+        } else {
+            error_log("DRIVER NEARBY SMS: Failed to send to $formatted_phone: " . $result['error']);
+        }
+    }
+
+    /**
+     * Send SMS via Twilio API
+     *
+     * @param string $account_sid Twilio Account SID
+     * @param string $auth_token Twilio Auth Token
+     * @param string $from_number Twilio phone number
+     * @param string $to_number Recipient phone number (E.164 format)
+     * @param string $message SMS message text
+     * @return array ['success' => bool, 'error' => string|null, 'sid' => string|null]
+     */
+    private function sendSMSViaTwilio($account_sid, $auth_token, $from_number, $to_number, $message): array {
+        $url = "https://api.twilio.com/2010-04-01/Accounts/{$account_sid}/Messages.json";
 
         $response = wp_remote_post($url, [
             'headers' => [
-                'Authorization' => 'Bearer ' . $settings['whatsapp_access_token'],
-                'Content-Type' => 'application/json'
+                'Authorization' => 'Basic ' . base64_encode("{$account_sid}:{$auth_token}"),
+                'Content-Type' => 'application/x-www-form-urlencoded'
             ],
-            'body' => json_encode($data),
-            'timeout' => 15
+            'body' => [
+                'From' => $from_number,
+                'To' => $to_number,
+                'Body' => $message
+            ],
+            'timeout' => 30
         ]);
 
         if (is_wp_error($response)) {
-            error_log('Dispatch WhatsApp Error: ' . $response->get_error_message());
-            return false;
+            return [
+                'success' => false,
+                'error' => $response->get_error_message(),
+                'sid' => null
+            ];
         }
 
-        $status_code = wp_remote_retrieve_response_code($response);
-        $body = wp_remote_retrieve_body($response);
+        $code = wp_remote_retrieve_response_code($response);
+        $body = json_decode(wp_remote_retrieve_body($response), true);
 
-        if ($status_code >= 200 && $status_code < 300) {
-            error_log('Dispatch WhatsApp: Message sent successfully to ' . $to_phone);
-            return true;
+        if ($code >= 200 && $code < 300) {
+            return [
+                'success' => true,
+                'error' => null,
+                'sid' => $body['sid'] ?? null
+            ];
+        }
+
+        return [
+            'success' => false,
+            'error' => $body['message'] ?? "HTTP $code",
+            'sid' => null
+        ];
+    }
+
+    /**
+     * Format phone number to E.164 international format
+     * Supports Spanish, German, French, Dutch, UK numbers
+     */
+    private function formatPhoneNumberE164($phone): ?string {
+        // Remove all non-numeric characters except leading +
+        $phone = preg_replace('/[^\d+]/', '', $phone);
+
+        // Already in E.164 format
+        if (preg_match('/^\+\d{10,15}$/', $phone)) {
+            return $phone;
+        }
+
+        // Remove leading + if any remaining issues
+        $phone = ltrim($phone, '+');
+
+        // Spanish numbers (6xx, 7xx, 9xx)
+        if (preg_match('/^(6|7|9)\d{8}$/', $phone)) {
+            return '+34' . $phone;
+        }
+
+        // German numbers (15x, 16x, 17x, 01x)
+        if (preg_match('/^(15|16|17|01)\d{8,10}$/', $phone)) {
+            $phone = ltrim($phone, '0');
+            return '+49' . $phone;
+        }
+
+        // Already has country code (00xx or just digits starting with country code)
+        if (preg_match('/^00(\d{10,14})$/', $phone, $m)) {
+            return '+' . $m[1];
+        }
+
+        // Assume Spanish if 9 digits
+        if (strlen($phone) === 9 && is_numeric($phone)) {
+            return '+34' . $phone;
+        }
+
+        // Return as-is with + if it looks valid
+        if (strlen($phone) >= 10 && strlen($phone) <= 15) {
+            return '+' . $phone;
+        }
+
+        return null;
+    }
+
+    /**
+     * Convert German umlauts for SMS (GSM-7 encoding compatibility)
+     */
+    private function convertUmlautsForSMS($text): string {
+        return str_replace(
+            ['ä', 'ö', 'ü', 'Ä', 'Ö', 'Ü', 'ß'],
+            ['ae', 'oe', 'ue', 'Ae', 'Oe', 'Ue', 'ss'],
+            $text
+        );
+    }
+
+    /**
+     * Send "Delivery Started" notification to customer (SMS + Email)
+     * Triggered when order is marked as "geladen" (loaded/ready)
+     *
+     * @param int $order_id Order ID
+     * @param WC_Order $order Order object
+     */
+    public function sendDeliveryStartedNotification($order_id, $order): void {
+        error_log("DELIVERY STARTED NOTIFICATION: Processing order #$order_id");
+
+        // Check suppression flag (prevents duplicate notifications during bulk operations)
+        $suppressed = get_transient('dispatch_suppress_notifications_' . $order_id);
+        if ($suppressed) {
+            error_log("DELIVERY STARTED NOTIFICATION: Suppressed for order #$order_id");
+            return;
+        }
+
+        // Check if already notified
+        if ($order->get_meta('_delivery_started_notification_sent') === 'yes') {
+            error_log("DELIVERY STARTED NOTIFICATION: Already sent for order #$order_id");
+            return;
+        }
+
+        // Get driver info
+        $driver_id = $order->get_meta('_assigned_driver');
+        $driver = $driver_id ? get_userdata($driver_id) : null;
+        $driver_name = $driver ? $driver->display_name : 'Ihr Fahrer';
+
+        // Generate tracking URL
+        $tracking_token = $order->get_meta('_tracking_token');
+        if (empty($tracking_token)) {
+            $tracking_token = wp_generate_password(32, false);
+            $order->update_meta_data('_tracking_token', $tracking_token);
+        }
+        $tracking_url = home_url('/tracking/' . $order_id . '/' . $tracking_token);
+
+        // Get delivery time slot
+        $delivery_time = $order->get_meta('Gewünschtes Zeitfenster - unverbindlich')
+            ?: $order->get_meta('_delivery_time_slot')
+            ?: $order->get_meta('orddd_lite_delivery_time')
+            ?: 'Heute';
+
+        // Check if SMS is enabled
+        $sms_enabled = get_option('dispatch_enable_sms_notifications') === 'yes';
+        $delivery_started_sms_enabled = get_option('dispatch_sms_delivery_started_enabled') === 'yes';
+
+        if ($sms_enabled && $delivery_started_sms_enabled) {
+            $this->sendDeliveryStartedSMS($order, $driver_name, $tracking_url, $delivery_time);
+        }
+
+        // Send Email (using WooCommerce email system)
+        $email_enabled = get_option('dispatch_enable_customer_notifications') === 'yes';
+        if ($email_enabled) {
+            do_action('dispatch_delivery_started_email', $order_id, $order, $driver_name, $tracking_url);
+        }
+
+        // Mark as notified
+        $order->update_meta_data('_delivery_started_notification_sent', 'yes');
+        $order->update_meta_data('_delivery_started_notification_sent_at', current_time('mysql'));
+        $order->save();
+
+        error_log("DELIVERY STARTED NOTIFICATION: Completed for order #$order_id");
+    }
+
+    /**
+     * Send "Delivery Started" SMS to customer
+     */
+    private function sendDeliveryStartedSMS($order, $driver_name, $tracking_url, $delivery_time): void {
+        // Get Twilio credentials
+        $account_sid = get_option('dispatch_twilio_account_sid');
+        $auth_token = get_option('dispatch_twilio_auth_token');
+        $from_number = get_option('dispatch_twilio_phone_number');
+
+        if (empty($account_sid) || empty($auth_token) || empty($from_number)) {
+            error_log("DELIVERY STARTED SMS: Twilio not configured");
+            return;
+        }
+
+        // Get customer phone
+        $customer_phone = $order->get_billing_phone();
+        if (empty($customer_phone)) {
+            error_log("DELIVERY STARTED SMS: No customer phone for order #{$order->get_id()}");
+            return;
+        }
+
+        // Format phone number
+        $formatted_phone = $this->formatPhoneNumberE164($customer_phone);
+        if (!$formatted_phone) {
+            error_log("DELIVERY STARTED SMS: Invalid phone format: $customer_phone");
+            return;
+        }
+
+        // Get SMS template
+        $template = get_option('dispatch_sms_delivery_started_template',
+            "🚚 {driver_name} ist unterwegs zu Ihnen!\n\nBestellung #{order_number}\nVoraussichtliche Lieferzeit: {delivery_time}\n\nTracking: {tracking_url}");
+
+        // Replace placeholders
+        $message = str_replace([
+            '{driver_name}',
+            '{order_number}',
+            '{delivery_time}',
+            '{tracking_url}',
+            '{customer_name}',
+            '{company_name}'
+        ], [
+            $driver_name,
+            $order->get_order_number(),
+            $delivery_time,
+            $tracking_url,
+            $order->get_billing_first_name(),
+            get_option('dispatch_default_depot_name', get_bloginfo('name'))
+        ], $template);
+
+        // Convert umlauts for SMS
+        $message = $this->convertUmlautsForSMS($message);
+
+        // Send SMS
+        $result = $this->sendSMSViaTwilio($account_sid, $auth_token, $from_number, $formatted_phone, $message);
+
+        if ($result['success']) {
+            error_log("DELIVERY STARTED SMS: Sent to $formatted_phone for order #{$order->get_id()}");
+            $order->add_order_note("🚚 SMS 'Fahrer unterwegs' gesendet an $formatted_phone");
         } else {
-            error_log('Dispatch WhatsApp Error: Status ' . $status_code . ' - ' . $body);
-            return false;
+            error_log("DELIVERY STARTED SMS: Failed - " . $result['error']);
+        }
+    }
+
+    /**
+     * Send "Delivered" notification to customer (SMS)
+     * Triggered when order is marked as delivered
+     *
+     * @param int $order_id Order ID
+     * @param WC_Order $order Order object
+     */
+    public function sendDeliveredNotification($order_id, $order): void {
+        error_log("DELIVERED NOTIFICATION: Processing order #$order_id");
+
+        // Check if SMS is enabled
+        $sms_enabled = get_option('dispatch_enable_sms_notifications') === 'yes';
+        $delivered_sms_enabled = get_option('dispatch_sms_delivered_enabled') === 'yes';
+
+        if (!$sms_enabled || !$delivered_sms_enabled) {
+            error_log("DELIVERED NOTIFICATION: SMS disabled for order #$order_id");
+            return;
+        }
+
+        // Check if already sent
+        if ($order->get_meta('_delivered_sms_sent') === 'yes') {
+            error_log("DELIVERED NOTIFICATION: Already sent for order #$order_id");
+            return;
+        }
+
+        // Get Twilio credentials
+        $account_sid = get_option('dispatch_twilio_account_sid');
+        $auth_token = get_option('dispatch_twilio_auth_token');
+        $from_number = get_option('dispatch_twilio_phone_number');
+
+        if (empty($account_sid) || empty($auth_token) || empty($from_number)) {
+            error_log("DELIVERED SMS: Twilio not configured");
+            return;
+        }
+
+        // Get customer phone
+        $customer_phone = $order->get_billing_phone();
+        if (empty($customer_phone)) {
+            error_log("DELIVERED SMS: No customer phone for order #$order_id");
+            return;
+        }
+
+        // Format phone number
+        $formatted_phone = $this->formatPhoneNumberE164($customer_phone);
+        if (!$formatted_phone) {
+            error_log("DELIVERED SMS: Invalid phone format: $customer_phone");
+            return;
+        }
+
+        // Get driver name
+        $driver_id = $order->get_meta('_assigned_driver');
+        $driver = $driver_id ? get_userdata($driver_id) : null;
+        $driver_name = $driver ? $driver->display_name : 'Ihr Fahrer';
+
+        // Get SMS template
+        $template = get_option('dispatch_sms_delivered_template',
+            "✅ Ihre Bestellung #{order_number} wurde erfolgreich zugestellt!\n\nVielen Dank für Ihre Bestellung bei {company_name}!");
+
+        // Replace placeholders
+        $message = str_replace([
+            '{driver_name}',
+            '{order_number}',
+            '{customer_name}',
+            '{company_name}'
+        ], [
+            $driver_name,
+            $order->get_order_number(),
+            $order->get_billing_first_name(),
+            get_option('dispatch_default_depot_name', get_bloginfo('name'))
+        ], $template);
+
+        // Convert umlauts for SMS
+        $message = $this->convertUmlautsForSMS($message);
+
+        // Send SMS
+        $result = $this->sendSMSViaTwilio($account_sid, $auth_token, $from_number, $formatted_phone, $message);
+
+        if ($result['success']) {
+            error_log("DELIVERED SMS: Sent to $formatted_phone for order #$order_id");
+            $order->add_order_note("✅ SMS 'Zugestellt' gesendet an $formatted_phone");
+            $order->update_meta_data('_delivered_sms_sent', 'yes');
+            $order->update_meta_data('_delivered_sms_sent_at', current_time('mysql'));
+            $order->save();
+        } else {
+            error_log("DELIVERED SMS: Failed - " . $result['error']);
+        }
+
+        // v2.9.79: After delivery completion, immediately check if NEXT customer should get SMS
+        if ($driver_id) {
+            $this->triggerNextCustomerSMS($driver_id, $order_id);
+        }
+    }
+
+    /**
+     * v2.9.79: Trigger SMS notification for the NEXT customer in delivery sequence
+     * Called immediately after a delivery is completed
+     *
+     * This ensures the next customer gets their "driver nearby" SMS right away
+     * instead of waiting for the 5-minute cron job
+     *
+     * @param int $driver_id Driver user ID
+     * @param int $completed_order_id The order that was just completed
+     */
+    private function triggerNextCustomerSMS($driver_id, $completed_order_id): void {
+        error_log("NEXT CUSTOMER SMS: Checking after order #$completed_order_id completion");
+
+        // Get driver's current position from Traccar or user meta
+        $driver_lat = null;
+        $driver_lng = null;
+
+        // Try Traccar first
+        $traccar_enabled = get_option('dispatch_traccar_enabled', 0);
+        if ($traccar_enabled) {
+            $device_id = get_user_meta($driver_id, '_traccar_device_id', true);
+            if ($device_id) {
+                $position = $this->getTraccarDevicePosition($device_id);
+                if ($position) {
+                    $driver_lat = $position['lat'];
+                    $driver_lng = $position['lng'];
+                    error_log("NEXT CUSTOMER SMS: Got driver position from Traccar: ($driver_lat, $driver_lng)");
+                }
+            }
+        }
+
+        // Fallback to user meta if no Traccar position
+        if (!$driver_lat || !$driver_lng) {
+            $driver_lat = get_user_meta($driver_id, 'current_latitude', true);
+            $driver_lng = get_user_meta($driver_id, 'current_longitude', true);
+            if ($driver_lat && $driver_lng) {
+                error_log("NEXT CUSTOMER SMS: Got driver position from user meta: ($driver_lat, $driver_lng)");
+            }
+        }
+
+        // If we have driver position, check for next customer notifications
+        if ($driver_lat && $driver_lng) {
+            $this->checkDriverNearbyNotifications($driver_id, floatval($driver_lat), floatval($driver_lng));
+        } else {
+            error_log("NEXT CUSTOMER SMS: No driver position available - cannot check next customer");
         }
     }
 
@@ -16950,19 +16880,6 @@ class DispatchDashboard {
         }
         
         // Dynamischer Status basierend auf Online/Offline Status
-        function updateDriverStatus() {
-            // Hole den aktuellen Online-Status aus LocalStorage oder API
-            const isOnline = localStorage.getItem('driver_online_status') === 'true';
-            const statusElement = document.getElementById('driver-status-display');
-            
-            if (isOnline) {
-                statusElement.textContent = 'Online';
-                statusElement.style.color = '#10b981';
-            } else {
-                statusElement.textContent = 'Offline';
-                statusElement.style.color = '#ef4444';
-            }
-        }
         
         // Status beim Laden der Seite aktualisieren
         document.addEventListener('DOMContentLoaded', function() {
@@ -17239,9 +17156,18 @@ class DispatchDashboard {
                                     <div style="display: flex; gap: 20px; color: #6b7280; font-size: 14px;">
                                         <span><strong>Kunde:</strong> <?php echo esc_html($customer_name); ?></span>
                                         <span><strong>Adresse:</strong> <?php echo esc_html($address); ?></span>
-                                        <span><strong>Lieferzeit:</strong> <?php 
+                                        <span><strong>Lieferzeit:</strong> <?php
                                             $delivery_time = $order->get_meta('Gewünschtes Zeitfenster - unverbindlich');
-                                            echo $delivery_time ?: 'Nicht angegeben';
+                                            if (empty($delivery_time)) {
+                                                // Fallback: Show delivery date if no time slot
+                                                $delivery_date_display = $order->get_meta('Gewünschtes Lieferdatum');
+                                                if (empty($delivery_date_display)) {
+                                                    $delivery_date_display = $order->get_meta('Lieferdatum');
+                                                }
+                                                echo $delivery_date_display ?: 'Nicht angegeben';
+                                            } else {
+                                                echo $delivery_time;
+                                            }
                                         ?></span>
                                     </div>
                                 </div>
@@ -17371,10 +17297,11 @@ class DispatchDashboard {
                             </div>
                             
                             <?php
-                            // Aggregate all products from all orders (using reversed order for packing)
+                            // Aggregate all products from ALL orders (not just last date!)
+                            // Fix: Use $orders instead of $reversed_orders to include all dates
                             $aggregated_products = [];
 
-                            foreach ($reversed_orders as $order) {
+                            foreach ($orders as $order) {
                                 foreach ($order->get_items() as $item) {
                                     $product = $item->get_product();
                                     if (!$product) continue;
@@ -17484,7 +17411,7 @@ class DispatchDashboard {
                                     if ($current_location !== $data['location']):
                                         $current_location = $data['location'];
                                 ?>
-                                <div class="location-separator" style="background: #e5e7eb; padding: 12px 16px; border-radius: 6px; margin: 10px 0 5px 0;">
+                                <div class="location-separator print-hide" style="background: #e5e7eb; padding: 12px 16px; border-radius: 6px; margin: 10px 0 5px 0;">
                                     <strong style="color: #374151; display: flex; align-items: center; gap: 8px;">
                                         📍 Standort/Regal: <?php echo esc_html($current_location); ?>
                                     </strong>
@@ -17514,7 +17441,7 @@ class DispatchDashboard {
                                             <?php endif; ?>
                                         </div>
                                         <?php endif; ?>
-                                        <div style="color: #6b7280; font-size: 14px; margin-bottom: 8px;">
+                                        <div class="loading-item-details print-hide" style="color: #6b7280; font-size: 14px; margin-bottom: 8px;">
                                             <?php if ($data['sku']): ?>
                                                 <span style="background: #f3f4f6; padding: 2px 6px; border-radius: 3px; margin-right: 8px;">
                                                     SKU: <?php echo esc_html($data['sku']); ?>
@@ -17524,7 +17451,7 @@ class DispatchDashboard {
                                                 📍 <?php echo esc_html($data['location']); ?>
                                             </span>
                                         </div>
-                                        <div style="color: #4b5563; font-size: 13px;">
+                                        <div class="loading-item-orders print-hide" style="color: #4b5563; font-size: 13px;">
                                             <strong>Enthalten in Bestellungen:</strong>
                                             <?php echo implode(', ', array_unique($data['orders'])); ?>
                                         </div>
@@ -17561,9 +17488,49 @@ class DispatchDashboard {
         
         <style>
         @media print {
-            .top-navigation, .dispatch-header, .btn { display: none !important; }
-            .driver-packlist-section { page-break-after: always; }
-            .check-box { background: white !important; }
+            /* WordPress Admin Sidebar komplett ausblenden */
+            #adminmenuwrap, #adminmenu, #wpadminbar, #adminmenumain,
+            #wpfooter, .notice, .update-nag, #screen-meta,
+            #adminmenuback, .wp-responsive-open #wpcontent {
+                display: none !important;
+            }
+
+            /* Hauptinhalt auf volle Breite */
+            #wpcontent, #wpbody, #wpbody-content, .wrap {
+                margin-left: 0 !important;
+                padding-left: 0 !important;
+                width: 100% !important;
+            }
+
+            body.wp-admin {
+                margin-left: 0 !important;
+            }
+
+            /* Plugin-spezifische Elemente ausblenden */
+            .top-navigation, .dispatch-header, .btn, .header-right {
+                display: none !important;
+            }
+
+            /* Seitenumbruch pro Fahrer */
+            .driver-packlist-section {
+                page-break-after: always;
+            }
+
+            /* Checkbox-Styling für Druck */
+            .check-box, .check-box-large {
+                background: white !important;
+                -webkit-print-color-adjust: exact;
+                print-color-adjust: exact;
+            }
+
+            /* LADELISTE KOMPLETT: Nur essenzielle Infos anzeigen */
+            .loading-list-header p,                /* "Alle Produkte aus X Bestellungen" Text */
+            .loading-summary,                       /* Gesamtsumme unten */
+            .location-separator,                    /* Standort/Regal Trenner */
+            .print-hide                             /* Alle Elemente mit print-hide Klasse */
+            {
+                display: none !important;
+            }
         }
         
         .driver-packlist-section:hover {
@@ -17657,8 +17624,10 @@ class DispatchDashboard {
                 printWindow.document.write('<style>');
                 printWindow.document.write('body { font-family: Arial, sans-serif; margin: 20px; }');
                 printWindow.document.write('.check-box-large { display: inline-block; width: 20px; height: 20px; border: 2px solid #333; margin-right: 10px; }');
-                printWindow.document.write('.location-separator { background: #f0f0f0; padding: 10px; margin: 15px 0 5px 0; font-weight: bold; }');
                 printWindow.document.write('img { max-width: 50px; max-height: 50px; }');
+                // Vereinfachte Druckansicht: Nur Produkte + Menge
+                printWindow.document.write('.print-hide, .location-separator, .loading-summary, .loading-list-header p { display: none !important; }');
+                printWindow.document.write('.loading-item { margin: 8px 0; padding: 10px; border: 1px solid #ccc; display: flex; align-items: center; gap: 10px; }');
                 printWindow.document.write('</style>');
                 printWindow.document.write('</head><body>');
                 printWindow.document.write(section.innerHTML);
@@ -19503,8 +19472,8 @@ class DispatchDashboard {
                         <!-- Sort by -->
                         <div>
                             <select name="sort_by" class="filter-select" style="padding: 8px 32px 8px 12px; border: 1px solid #d1d5db; border-radius: 6px; color: #6b7280; background: white; cursor: pointer;">
-                                <option value="newest" <?php echo $sort_by === 'newest' ? 'selected' : ''; ?>>Sort by: Neueste</option>
-                                <option value="oldest" <?php echo $sort_by === 'oldest' ? 'selected' : ''; ?>>Sort by: Älteste</option>
+                                <option value="newest" <?php echo $sort_by === 'newest' ? 'selected' : ''; ?>>Neueste</option>
+                                <option value="oldest" <?php echo $sort_by === 'oldest' ? 'selected' : ''; ?>>Älteste</option>
                             </select>
                         </div>
 
@@ -20167,6 +20136,11 @@ class DispatchDashboard {
             'dispatch_sumup_affiliate_key' => get_option('dispatch_sumup_affiliate_key', ''),
             'dispatch_sumup_app_identifier' => get_option('dispatch_sumup_app_identifier', ''),
             'average_stop_duration' => get_option('dispatch_average_stop_duration', '10'),
+            // Traccar GPS Tracking Settings (mit Fallback-Defaults)
+            'traccar_enabled' => get_option('dispatch_traccar_enabled', 'yes'),
+            'traccar_api_url' => get_option('dispatch_traccar_api_url', 'http://91.98.17.58:8082'),
+            'traccar_email' => get_option('dispatch_traccar_email', 'info@entregamos-bebidas.es'),
+            'traccar_password' => get_option('dispatch_traccar_password', 'agpdj7xj'),
         ];
     }
 
@@ -20264,8 +20238,10 @@ class DispatchDashboard {
             $body = json_decode($response_body, true);
 
             if (isset($body['id'])) {
-                // Save device ID to user meta
+                // Save device ID to user meta - BOTH keys for compatibility (v2.9.82)
+                update_user_meta($driver_id, '_traccar_device_id', $body['id']);
                 update_user_meta($driver_id, 'traccar_device_id', $body['id']);
+                update_user_meta($driver_id, '_traccar_unique_id', $unique_id);
                 update_user_meta($driver_id, 'traccar_unique_id', $unique_id);
                 error_log('Traccar device created successfully: ID=' . $body['id'] . ' for driver ' . $driver_id);
             } else {
@@ -20315,7 +20291,11 @@ class DispatchDashboard {
         // This runs after position is saved, so notifications are based on real-time location
         $this->checkDriverNearbyNotifications($driver_id, $latitude, $longitude);
 
-        $traccar_device_id = get_user_meta($driver_id, 'traccar_device_id', true);
+        // Get Traccar device ID - check BOTH meta keys (v2.9.82)
+        $traccar_device_id = get_user_meta($driver_id, '_traccar_device_id', true);
+        if (empty($traccar_device_id)) {
+            $traccar_device_id = get_user_meta($driver_id, 'traccar_device_id', true);
+        }
 
         if (!$traccar_device_id) {
             error_log("Driver $driver_id has no Traccar device ID - position not sent to Traccar");
@@ -20454,6 +20434,11 @@ class DispatchDashboard {
         update_option('dispatch_google_maps_backend_api_key', sanitize_text_field($_POST['google_maps_backend_api_key'] ?? ''));
         update_option('dispatch_enable_route_optimization', sanitize_text_field($_POST['enable_route_optimization'] ?? 'no'));
         update_option('dispatch_map_zoom_level', intval($_POST['map_zoom_level'] ?? 15));
+
+        // OSRM Routing Settings
+        update_option('dispatch_osrm_enabled', isset($_POST['dispatch_osrm_enabled']) ? 1 : 0);
+        update_option('dispatch_osrm_api_url', esc_url_raw($_POST['dispatch_osrm_api_url'] ?? 'https://router.project-osrm.org'));
+
         update_option('dispatch_default_depot_name', sanitize_text_field($_POST['default_depot_name'] ?? 'Hauptlager'));
         update_option('dispatch_default_depot_address', sanitize_text_field($_POST['default_depot_address'] ?? ''));
         update_option('dispatch_depot_phone', sanitize_text_field($_POST['depot_phone'] ?? ''));
@@ -21206,11 +21191,12 @@ class DispatchDashboard {
         $duration_seconds = $route['duration']; // in seconds
         $duration_minutes = round($duration_seconds / 60);
 
-        // Add 15% buffer for realistic city traffic (OSRM doesn't have live traffic)
-        $duration_minutes_with_buffer = round($duration_minutes * 1.15);
+        // ✅ BEST PRACTICE 2025: 20% buffer for realistic city traffic
+        // OSRM doesn't have live traffic - 20% accounts for typical delays
+        $duration_minutes_with_buffer = round($duration_minutes * 1.20);
 
         error_log(sprintf(
-            'Dispatch: OSRM API (FREE!) - Distance: %.2f km, Duration: %d min (base) / %d min (with 15%% buffer)',
+            'Dispatch: OSRM API (FREE!) - Distance: %.2f km, Duration: %d min (base) / %d min (with 20%% buffer)',
             $distance_km,
             $duration_minutes,
             $duration_minutes_with_buffer
@@ -21226,11 +21212,30 @@ class DispatchDashboard {
             'cached_at' => time() // Timestamp for cache age tracking
         ];
 
-        // ✅ OPTIMIZATION: Cache result for 2 minutes (120 seconds)
+        // ✅ BEST PRACTICE 2025: Adaptive cache TTL based on distance
+        // Nearby deliveries change fast → short cache
+        // Far deliveries are stable → longer cache
         if ($order_id > 0 && $driver_id > 0) {
             $cache_key = "dispatch_driving_distance_{$driver_id}_{$order_id}";
-            set_transient($cache_key, $result, 120); // TTL: 2 minutes
-            error_log("Dispatch: CACHED driving distance for order #{$order_id} for 2 minutes - Future calls will be FREE!");
+
+            // Adaptive TTL based on distance:
+            // < 5 km: 60s (situation changes rapidly - driver approaching)
+            // 5-15 km: 90s (balanced - moderate changes)
+            // > 15 km: 120s (stable - driver far away)
+            if ($distance_km < 5) {
+                $cache_ttl = 60;
+            } elseif ($distance_km < 15) {
+                $cache_ttl = 90;
+            } else {
+                $cache_ttl = 120;
+            }
+
+            set_transient($cache_key, $result, $cache_ttl);
+            error_log(sprintf(
+                "Dispatch: CACHED driving distance for order #{$order_id} for %ds (distance: %.1f km, source: OSRM)",
+                $cache_ttl,
+                $distance_km
+            ));
         }
 
         return $result;
@@ -21469,6 +21474,13 @@ class DispatchDashboard {
             wp_send_json_error('Keine Berechtigung');
         }
 
+        // Prüfe ob Routenoptimierung aktiviert ist
+        $route_optimization_enabled = get_option('dispatch_enable_route_optimization', 'yes') === 'yes';
+
+        // Depot-Koordinaten für Distanzberechnung
+        $depot_lat = floatval(get_option('dispatch_depot_latitude', 39.5696));
+        $depot_lng = floatval(get_option('dispatch_depot_longitude', 2.6502));
+
         // Hole alle Fahrer mit Rolle 'lieferfahrer'
         $drivers = get_users([
             'role' => 'lieferfahrer',
@@ -21486,6 +21498,11 @@ class DispatchDashboard {
                 'limit' => 100
             ]);
 
+            // Wenn Routenoptimierung aktiv: Nach Distanz sortieren
+            if ($route_optimization_enabled && !empty($orders)) {
+                $orders = $this->sortOrdersByDistance($orders, $depot_lat, $depot_lng);
+            }
+
             $sequence = 1;
             foreach ($orders as $order) {
                 update_post_meta($order->get_id(), '_delivery_sequence', $sequence);
@@ -21493,7 +21510,104 @@ class DispatchDashboard {
             }
         }
 
-        wp_send_json_success('Sequences automatisch vergeben');
+        $mode = $route_optimization_enabled ? 'nach Distanz optimiert' : 'nach Eingangsreihenfolge';
+        wp_send_json_success("Sequences automatisch vergeben ($mode)");
+    }
+
+    /**
+     * Sortiert Bestellungen nach Distanz vom Depot (Nearest Neighbor Algorithmus)
+     *
+     * @param array $orders Array von WC_Order Objekten
+     * @param float $start_lat Start-Latitude (Depot)
+     * @param float $start_lng Start-Longitude (Depot)
+     * @return array Sortierte Bestellungen
+     */
+    private function sortOrdersByDistance(array $orders, float $start_lat, float $start_lng): array {
+        if (empty($orders)) {
+            return $orders;
+        }
+
+        // Sammle Koordinaten für alle Bestellungen
+        $orders_with_coords = [];
+        $orders_without_coords = [];
+
+        foreach ($orders as $order) {
+            $lat = floatval($order->get_meta('lpac_latitude') ?: $order->get_meta('_shipping_latitude'));
+            $lng = floatval($order->get_meta('lpac_longitude') ?: $order->get_meta('_shipping_longitude'));
+
+            if ($lat && $lng) {
+                $orders_with_coords[] = [
+                    'order' => $order,
+                    'lat' => $lat,
+                    'lng' => $lng,
+                    'visited' => false
+                ];
+            } else {
+                // Bestellungen ohne Koordinaten ans Ende
+                $orders_without_coords[] = $order;
+            }
+        }
+
+        if (empty($orders_with_coords)) {
+            return $orders;
+        }
+
+        // Nearest Neighbor Algorithmus
+        $sorted = [];
+        $current_lat = $start_lat;
+        $current_lng = $start_lng;
+
+        while (count($sorted) < count($orders_with_coords)) {
+            $nearest_index = -1;
+            $nearest_distance = PHP_FLOAT_MAX;
+
+            foreach ($orders_with_coords as $index => $item) {
+                if ($item['visited']) continue;
+
+                $distance = $this->haversineDistance($current_lat, $current_lng, $item['lat'], $item['lng']);
+
+                if ($distance < $nearest_distance) {
+                    $nearest_distance = $distance;
+                    $nearest_index = $index;
+                }
+            }
+
+            if ($nearest_index >= 0) {
+                $orders_with_coords[$nearest_index]['visited'] = true;
+                $sorted[] = $orders_with_coords[$nearest_index]['order'];
+                $current_lat = $orders_with_coords[$nearest_index]['lat'];
+                $current_lng = $orders_with_coords[$nearest_index]['lng'];
+            }
+        }
+
+        // Bestellungen ohne Koordinaten anhängen
+        return array_merge($sorted, $orders_without_coords);
+    }
+
+    /**
+     * Berechnet die Entfernung zwischen zwei Koordinaten (Haversine-Formel)
+     *
+     * @param float $lat1 Latitude Punkt 1
+     * @param float $lng1 Longitude Punkt 1
+     * @param float $lat2 Latitude Punkt 2
+     * @param float $lng2 Longitude Punkt 2
+     * @return float Entfernung in Kilometern
+     */
+    private function haversineDistance(float $lat1, float $lng1, float $lat2, float $lng2): float {
+        $earth_radius = 6371; // km
+
+        $lat1_rad = deg2rad($lat1);
+        $lat2_rad = deg2rad($lat2);
+        $delta_lat = deg2rad($lat2 - $lat1);
+        $delta_lng = deg2rad($lng2 - $lng1);
+
+        $a = sin($delta_lat / 2) * sin($delta_lat / 2) +
+             cos($lat1_rad) * cos($lat2_rad) *
+             sin($delta_lng / 2) * sin($delta_lng / 2);
+
+        $c = 2 * atan2(sqrt($a), sqrt(1 - $a));
+
+        return $earth_radius * $c;
     }
 
     /**
@@ -23650,7 +23764,7 @@ class DispatchDashboard {
                     text-decoration: none;
                     color: #48BB78;
                     transition: color 0.3s ease;
-                    padding: 6px 2px;
+                    padding: 6px 12px;
                 }
 
                 .nav-item.active {
@@ -23663,7 +23777,7 @@ class DispatchDashboard {
 
                 .nav-item .icon {
                     font-size: 20px;
-                    margin-bottom: 2px;
+                    margin-bottom: 4px;
                 }
 
                 .nav-item .label {
@@ -23673,11 +23787,11 @@ class DispatchDashboard {
                 .nav-item.active {
                     color: #48BB78 !important;
                 }
-                
+
                 .nav-item.active .icon {
-                    transform: scale(1.1);
+                    /* transform: scale(1.1); */ /* Entfernt - Icons sollen sich nicht bewegen */
                 }
-                
+
                 .nav-item.active .label {
                     color: #48BB78;
                     font-weight: 600;
@@ -24562,7 +24676,7 @@ class DispatchDashboard {
             <div class="bottom-navigation">
                 <a href="#bestellungen" class="nav-item">
                     <div class="icon">
-                        <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                        <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                             <path d="M8 2v3h8V2H8zM9 9l3 4 4-6 1 1.5L12 15 8 10l1-1z"/>
                             <path d="M19 3h-1V1h-2v2H8V1H6v2H5c-1.11 0-1.99.89-1.99 2L3 19a2 2 0 002 2h14c1.1 0 2-.9 2-2V5c0-1.11-.9-2-2-2zm0 16H5V8h14v11z"/>
                         </svg>
@@ -24571,7 +24685,7 @@ class DispatchDashboard {
                 </a>
                 <a href="#karte" class="nav-item">
                     <div class="icon">
-                        <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                        <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                             <path d="M20.5 3l-.16.03L15 5.1 9 3 3.36 4.9c-.21.07-.36.25-.36.48V20.5c0 .28.22.5.5.5l.16-.03L9 18.9l6 2.1 5.64-1.9c.21-.07.36-.25.36-.48V3.5c0-.28-.22-.5-.5-.5zM15 19l-6-2.11V5l6 2.11V19z"/>
                         </svg>
                     </div>
@@ -24579,7 +24693,7 @@ class DispatchDashboard {
                 </a>
                 <a href="#warten" class="nav-item">
                     <div class="icon">
-                        <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                        <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                             <path d="M15 1H9v2h6V1zm-4 13h2V8h-2v6zm8.03-6.61l1.42-1.42c-.43-.51-.9-.99-1.41-1.41l-1.42 1.42C16.07 4.74 14.12 4 12 4c-4.97 0-9 4.03-9 9s4.02 9 9 9 9-4.03 9-9c0-2.12-.74-4.07-1.97-5.61zM12 20c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/>
                         </svg>
                     </div>
@@ -24587,7 +24701,7 @@ class DispatchDashboard {
                 </a>
                 <a href="#leistung" class="nav-item">
                     <div class="icon">
-                        <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                        <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                             <path d="M5 9.2h3V19H5zM10.6 5h2.8v14h-2.8zm5.6 8H19v6h-2.8z"/>
                         </svg>
                     </div>
@@ -26937,7 +27051,7 @@ class DispatchDashboard {
                         <div class="bottom-navigation">
                             <a href="#bestellungen" class="nav-item active" onclick="showBestellungen()">
                                 <div class="icon">
-                                    <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                         <path d="M8 2v3h8V2H8zM9 9l3 4 4-6 1 1.5L12 15 8 10l1-1z"/>
                                         <path d="M19 3h-1V1h-2v2H8V1H6v2H5c-1.11 0-1.99.89-1.99 2L3 19a2 2 0 002 2h14c1.1 0 2-.9 2-2V5c0-1.11-.9-2-2-2zm0 16H5V8h14v11z"/>
                                     </svg>
@@ -26946,7 +27060,7 @@ class DispatchDashboard {
                             </a>
                             <a href="#karte" class="nav-item" onclick="showKarte()">
                                 <div class="icon">
-                                    <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                         <path d="M20.5 3l-.16.03L15 5.1 9 3 3.36 4.9c-.21.07-.36.25-.36.48V20.5c0 .28.22.5.5.5l.16-.03L9 18.9l6 2.1 5.64-1.9c.21-.07.36-.25.36-.48V3.5c0-.28-.22-.5-.5-.5zM15 19l-6-2.11V5l6 2.11V19z"/>
                                     </svg>
                                 </div>
@@ -26954,7 +27068,7 @@ class DispatchDashboard {
                             </a>
                             <a href="#warten" class="nav-item" onclick="showWarten()">
                                 <div class="icon">
-                                    <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                         <path d="M15 1H9v2h6V1zm-4 13h2V8h-2v6zm8.03-6.61l1.42-1.42c-.43-.51-.9-.99-1.41-1.41l-1.42 1.42C16.07 4.74 14.12 4 12 4c-4.97 0-9 4.03-9 9s4.02 9 9 9 9-4.03 9-9c0-2.12-.74-4.07-1.97-5.61zM12 20c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7-7z"/>
                                     </svg>
                                 </div>
@@ -26962,7 +27076,7 @@ class DispatchDashboard {
                             </a>
                             <a href="#packliste" class="nav-item" onclick="showPackliste()">
                                 <div class="icon">
-                                    <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                         <path d="M19 3h-4.18C14.4 1.84 13.3 1 12 1c-1.3 0-2.4.84-2.82 2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 0c.55 0 1 .45 1 1s-.45 1-1 1-1-.45-1-1 .45-1 1-1zm2 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z"/>
                                     </svg>
                                 </div>
@@ -27387,7 +27501,7 @@ class DispatchDashboard {
                             </button>
                             ` : ''}
 
-                            <button class="action-button payment" onclick="openSumUpPayment(${order.order_id}, '${formatPrice(order.net_payment || order.total)}', '${order.customer_name || ''}')">
+                            <button class="action-button payment" onclick="openSumUpPayment(${order.order_id}, '${formatPrice(order.total)}')">
                                 <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
                                     <path d="M20 4H4c-1.11 0-1.99.89-1.99 2L2 18c0 1.11.89 2 2 2h16c1.11 0 2-.89 2-2V6c0-1.11-.89-2-2-2zm0 14H4v-6h16v6zm0-10H4V6h16v2z"/>
                                 </svg>
@@ -28720,55 +28834,54 @@ class DispatchDashboard {
                     return html;
                 }
 
-                // Pfand-Items aus den Einstellungen laden (dynamisch aus DB)
-                const pfandItemsConfig = <?php
-                    $pfand_items = get_option('dispatch_pfand_items', [
-                        ['id' => 'water', 'icon' => '🍼', 'name' => 'Wasserflasche', 'amount' => 0.50, 'active' => true],
-                        ['id' => 'beer', 'icon' => '🍺', 'name' => 'Bierflasche', 'amount' => 0.25, 'active' => true]
-                    ]);
-                    // Nur aktive Items
-                    $active_items = array_filter($pfand_items, function($item) {
-                        return !isset($item['active']) || $item['active'] === true;
-                    });
-                    echo json_encode(array_values($active_items), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
-                ?>;
-
                 function generateMissingBottlesHTML() {
-                    if (!pfandItemsConfig || pfandItemsConfig.length === 0) {
-                        return ''; // Keine Pfand-Items konfiguriert
-                    }
-
-                    let itemsHTML = '';
-                    pfandItemsConfig.forEach(item => {
-                        itemsHTML += `
-                            <div class="pfand-item-row" style="background:white; padding:10px; border-radius:5px;" data-pfand-id="${item.id}" data-pfand-amount="${item.amount}">
-                                <div class="pfand-item-name">
-                                    <div style="flex:1;">
-                                        <div style="color:#374151; font-size:1rem; font-weight:500;">${item.icon} ${item.name}</div>
-                                        <div style="color:#6b7280; font-size:0.875rem; margin-top:4px;">€${parseFloat(item.amount).toFixed(2)}/Stück</div>
-                                    </div>
-                                </div>
-                                <div class="pfand-item-controls">
-                                    <div class="pfand-quantity-control">
-                                        <button type="button" class="pfand-quantity-btn missing-btn minus" data-target="${item.id}" aria-label="Weniger ${item.name}">−</button>
-                                        <input type="number" id="missing-${item.id}" class="pfand-quantity-input missing-input" data-amount="${item.amount}" value="0" min="0" max="99" aria-label="Anzahl fehlende ${item.name}" readonly>
-                                        <button type="button" class="pfand-quantity-btn missing-btn plus" data-target="${item.id}" aria-label="Mehr ${item.name}">+</button>
-                                    </div>
-                                    <div style="min-width:80px; text-align:right;">
-                                        <div style="font-weight:bold; color:#dc3545; font-size:1rem;">€<span id="${item.id}-total">0.00</span></div>
-                                    </div>
-                                </div>
-                            </div>
-                        `;
-                    });
-
                     return `
                         <div id="missing-bottles-section" style="display:none; background:#fff3cd; border:1px solid #ffeaa7; padding:12px; border-radius:8px; margin-bottom:12px;">
                             <h4 style="margin:0 0 8px 0; color:#856404; font-size:1rem;">⚠️ Fehlende Flaschen</h4>
                             <p style="margin:0 0 12px 0; color:#856404; font-size:0.875rem;">Abzug für fehlende Flaschen eingeben:</p>
+
                             <div style="display:flex; flex-direction:column; gap:12px;">
-                                ${itemsHTML}
+                                <!-- Wasserflasche -->
+                                <div class="pfand-item-row" style="background:white; padding:10px; border-radius:5px;">
+                                    <div class="pfand-item-name">
+                                        <div style="flex:1;">
+                                            <div style="color:#374151; font-size:1rem; font-weight:500;">🍼 Wasserflasche</div>
+                                            <div style="color:#6b7280; font-size:0.875rem; margin-top:4px;">€0.25/Stück</div>
+                                        </div>
+                                    </div>
+                                    <div class="pfand-item-controls">
+                                        <div class="pfand-quantity-control">
+                                            <button type="button" class="pfand-quantity-btn missing-btn minus" data-target="water" aria-label="Weniger Wasserflaschen">−</button>
+                                            <input type="number" id="missing-water" class="pfand-quantity-input" value="0" min="0" max="99" aria-label="Anzahl fehlende Wasserflaschen" readonly>
+                                            <button type="button" class="pfand-quantity-btn missing-btn plus" data-target="water" aria-label="Mehr Wasserflaschen">+</button>
+                                        </div>
+                                        <div style="min-width:80px; text-align:right;">
+                                            <div style="font-weight:bold; color:#dc3545; font-size:1rem;">€<span id="water-total">0.00</span></div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Bierflasche -->
+                                <div class="pfand-item-row" style="background:white; padding:10px; border-radius:5px;">
+                                    <div class="pfand-item-name">
+                                        <div style="flex:1;">
+                                            <div style="color:#374151; font-size:1rem; font-weight:500;">🍺 Bierflasche</div>
+                                            <div style="color:#6b7280; font-size:0.875rem; margin-top:4px;">€0.50/Stück</div>
+                                        </div>
+                                    </div>
+                                    <div class="pfand-item-controls">
+                                        <div class="pfand-quantity-control">
+                                            <button type="button" class="pfand-quantity-btn missing-btn minus" data-target="beer" aria-label="Weniger Bierflaschen">−</button>
+                                            <input type="number" id="missing-beer" class="pfand-quantity-input" value="0" min="0" max="99" aria-label="Anzahl fehlende Bierflaschen" readonly>
+                                            <button type="button" class="pfand-quantity-btn missing-btn plus" data-target="beer" aria-label="Mehr Bierflaschen">+</button>
+                                        </div>
+                                        <div style="min-width:80px; text-align:right;">
+                                            <div style="font-weight:bold; color:#dc3545; font-size:1rem;">€<span id="beer-total">0.00</span></div>
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
+
                             <div id="missing-summary" style="display:none; text-align:right; margin-top:15px; padding-top:15px; border-top:1px solid #ffeaa7;">
                                 <strong style="color:#dc3545;">Abzug für fehlende Flaschen: <span id="missing-total">€0.00</span></strong>
                             </div>
@@ -29035,29 +29148,40 @@ class DispatchDashboard {
                         }
                     });
 
-                    // Berechne fehlende Flaschen Abzug - DYNAMISCH aus Einstellungen
+                    // Berechne fehlende Flaschen Abzug
                     let totalDeduction = 0;
+                    const missingWater = parseInt($('#missing-water').val()) || 0;
+                    const missingBeer = parseInt($('#missing-beer').val()) || 0;
 
-                    // Iteriere über alle konfigurierten Pfand-Items
-                    pfandItemsConfig.forEach(item => {
-                        const missingCount = parseInt($('#missing-' + item.id).val()) || 0;
-                        const itemAmount = parseFloat(item.amount) || 0;
-                        const itemTotal = missingCount * itemAmount;
+                    // Update individual bottle totals
+                    const waterTotal = missingWater * 0.25;
+                    const beerTotal = missingBeer * 0.50;
+                    $('#water-total').text(waterTotal.toFixed(2));
+                    $('#beer-total').text(beerTotal.toFixed(2));
 
-                        // Update individual item total display
-                        $('#' + item.id + '-total').text(itemTotal.toFixed(2));
+                    if (missingWater > 0) {
+                        const deduction = missingWater * 0.25;
+                        totalDeduction += deduction;
+                        summaryItems.push({
+                            name: 'Fehlende Wasserflaschen',
+                            quantity: missingWater,
+                            price: -0.25,
+                            total: -deduction,
+                            isDeduction: true
+                        });
+                    }
 
-                        if (missingCount > 0) {
-                            totalDeduction += itemTotal;
-                            summaryItems.push({
-                                name: 'Fehlende ' + item.name,
-                                quantity: missingCount,
-                                price: -itemAmount,
-                                total: -itemTotal,
-                                isDeduction: true
-                            });
-                        }
-                    });
+                    if (missingBeer > 0) {
+                        const deduction = missingBeer * 0.50;
+                        totalDeduction += deduction;
+                        summaryItems.push({
+                            name: 'Fehlende Bierflaschen',
+                            quantity: missingBeer,
+                            price: -0.50,
+                            total: -deduction,
+                            isDeduction: true
+                        });
+                    }
 
                     const netCredit = Math.max(0, totalCredit - totalDeduction);
 
@@ -29302,7 +29426,7 @@ class DispatchDashboard {
                         <div class="bottom-navigation">
                             <a href="#bestellungen" class="nav-item active" onclick="showBestellungen()">
                                 <div class="icon">
-                        <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                        <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                             <path d="M8 2v3h8V2H8zM9 9l3 4 4-6 1 1.5L12 15 8 10l1-1z"/>
                             <path d="M19 3h-1V1h-2v2H8V1H6v2H5c-1.11 0-1.99.89-1.99 2L3 19a2 2 0 002 2h14c1.1 0 2-.9 2-2V5c0-1.11-.9-2-2-2zm0 16H5V8h14v11z"/>
                         </svg>
@@ -29311,7 +29435,7 @@ class DispatchDashboard {
                             </a>
                             <a href="#karte" class="nav-item" onclick="showKarte()">
                                 <div class="icon">
-                        <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                        <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                             <path d="M20.5 3l-.16.03L15 5.1 9 3 3.36 4.9c-.21.07-.36.25-.36.48V20.5c0 .28.22.5.5.5l.16-.03L9 18.9l6 2.1 5.64-1.9c.21-.07.36-.25.36-.48V3.5c0-.28-.22-.5-.5-.5zM15 19l-6-2.11V5l6 2.11V19z"/>
                         </svg>
                     </div>
@@ -29319,7 +29443,7 @@ class DispatchDashboard {
                             </a>
                             <a href="#warten" class="nav-item" onclick="showWarten()">
                                 <div class="icon">
-                        <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                        <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                             <path d="M15 1H9v2h6V1zm-4 13h2V8h-2v6zm8.03-6.61l1.42-1.42c-.43-.51-.9-.99-1.41-1.41l-1.42 1.42C16.07 4.74 14.12 4 12 4c-4.97 0-9 4.03-9 9s4.02 9 9 9 9-4.03 9-9c0-2.12-.74-4.07-1.97-5.61zM12 20c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/>
                         </svg>
                     </div>
@@ -29327,7 +29451,7 @@ class DispatchDashboard {
                             </a>
                             <a href="#packliste" class="nav-item" onclick="showPackliste()">
                                 <div class="icon">
-                        <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                        <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                             <path d="M19 3h-4.18C14.4 1.84 13.3 1 12 1c-1.3 0-2.4.84-2.82 2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 0c.55 0 1 .45 1 1s-.45 1-1 1-1-.45-1-1 .45-1 1-1zm2 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z"/>
                         </svg>
                     </div>
@@ -29715,7 +29839,7 @@ class DispatchDashboard {
                                 <div class="bottom-navigation" style="margin-top: 80px;">
                                     <a href="#bestellungen" class="nav-item active" onclick="showBestellungen()">
                                         <div class="icon">
-                                            <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                                 <path d="M8 2v3h8V2H8zM9 9l3 4 4-6 1 1.5L12 15 8 10l1-1z"/>
                                                 <path d="M19 3h-1V1h-2v2H8V1H6v2H5c-1.11 0-1.99.89-1.99 2L3 19a2 2 0 002 2h14c1.1 0 2-.9 2-2V5c0-1.11-.9-2-2-2zm0 16H5V8h14v11z"/>
                                             </svg>
@@ -29724,7 +29848,7 @@ class DispatchDashboard {
                                     </a>
                                     <a href="#karte" class="nav-item" onclick="showKarte()">
                                         <div class="icon">
-                                            <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                                 <path d="M20.5 3l-.16.03L15 5.1 9 3 3.36 4.9c-.21.07-.36.25-.36.48V20.5c0 .28.22.5.5.5l.16-.03L9 18.9l6 2.1 5.64-1.9c.21-.07.36-.25.36-.48V3.5c0-.28-.22-.5-.5-.5zM15 19l-6-2.11V5l6 2.11V19z"/>
                                             </svg>
                                         </div>
@@ -29732,7 +29856,7 @@ class DispatchDashboard {
                                     </a>
                                     <a href="#warten" class="nav-item" onclick="showWarten()">
                                         <div class="icon">
-                                            <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                                 <path d="M15 1H9v2h6V1zm-4 13h2V8h-2v6zm8.03-6.61l1.42-1.42c-.43-.51-.9-.99-1.41-1.41l-1.42 1.42C16.07 4.74 14.12 4 12 4c-4.97 0-9 4.03-9 9s4.02 9 9 9 9-4.03 9-9c0-2.12-.74-4.07-1.97-5.61zM12 20c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/>
                                             </svg>
                                         </div>
@@ -29740,7 +29864,7 @@ class DispatchDashboard {
                                     </a>
                                     <a href="#packliste" class="nav-item" onclick="showPackliste()">
                                         <div class="icon">
-                                            <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                                 <path d="M19 3h-4.18C14.4 1.84 13.3 1 12 1c-1.3 0-2.4.84-2.82 2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 0c.55 0 1 .45 1 1s-.45 1-1 1-1-.45-1-1 .45-1 1-1zm2 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z"/>
                                             </svg>
                                         </div>
@@ -31320,23 +31444,13 @@ class DispatchDashboard {
                 }
             }
 
-            function openSumUpPayment(orderId, amount, customerName = '') {
-                // Remove € symbol and format as decimal for SumUp (uses decimal, NOT cents!)
-                const numericAmount = parseFloat(amount.replace('€', '').replace(',', '.').trim());
-                // Format with 2 decimal places (e.g., 81.82)
-                const formattedAmount = numericAmount.toFixed(2);
+            function openSumUpPayment(orderId, amount) {
+                // Remove € symbol and convert to cents for SumUp
+                const numericAmount = parseFloat(amount.replace('€', '').trim());
+                const amountInCents = Math.round(numericAmount * 100);
 
                 // Get current user's SumUp affiliate key from user meta
                 const userId = '<?php echo get_current_user_id(); ?>';
-
-                // Detect platform (iOS vs Android)
-                const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
-                const isAndroid = /Android/.test(navigator.userAgent);
-
-                // Build title with customer name (shown in SumUp app description field)
-                const title = customerName
-                    ? encodeURIComponent(customerName)
-                    : encodeURIComponent('Bestellung ' + orderId);
 
                 // Fetch user's SumUp credentials
                 fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
@@ -31352,27 +31466,12 @@ class DispatchDashboard {
                 .then(response => response.json())
                 .then(data => {
                     if (data.success && data.data.affiliate_key) {
-                        let sumupUrl;
-                        const baseUrl = window.location.origin + window.location.pathname;
+                        // Build SumUp URL
+                        const callbackSuccess = encodeURIComponent(window.location.href + '?sumup_success=1&order_id=' + orderId);
+                        const callbackFail = encodeURIComponent(window.location.href + '?sumup_fail=1&order_id=' + orderId);
 
-                        if (isAndroid) {
-                            // Android: Uses single 'callback' parameter and 'total' instead of 'amount'
-                            // Also requires 'app-id' parameter
-                            // See: https://github.com/sumup/sumup-android-api
-                            const callback = encodeURIComponent(baseUrl + '?sumup_callback=1&order_id=' + orderId);
-                            const appId = data.data.app_identifier || 'es.entregamos-bebidas.dispatch';
+                        const sumupUrl = `sumupmerchant://pay/1.0?affiliate-key=${data.data.affiliate_key}&app-id=de.absa.driver&total=${amountInCents}&currency=EUR&title=Bestellung%20${orderId}&callbacksuccess=${callbackSuccess}&callbackfail=${callbackFail}&foreign-tx-id=${orderId}`;
 
-                            sumupUrl = `sumupmerchant://pay/1.0?affiliate-key=${data.data.affiliate_key}&app-id=${appId}&total=${formattedAmount}&currency=EUR&title=${title}&callback=${callback}&foreign-tx-id=${orderId}`;
-                        } else {
-                            // iOS: Uses separate 'callbacksuccess' and 'callbackfail' parameters
-                            // See: https://github.com/sumup/sumup-ios-url-scheme
-                            const callbackSuccess = encodeURIComponent(baseUrl + '?sumup_success=1&order_id=' + orderId);
-                            const callbackFail = encodeURIComponent(baseUrl + '?sumup_fail=1&order_id=' + orderId);
-
-                            sumupUrl = `sumupmerchant://pay/1.0?affiliate-key=${data.data.affiliate_key}&amount=${formattedAmount}&currency=EUR&title=${title}&callbacksuccess=${callbackSuccess}&callbackfail=${callbackFail}&foreign-tx-id=${orderId}&skip-screen-success=true`;
-                        }
-
-                        console.log('Platform:', isAndroid ? 'Android' : (isIOS ? 'iOS' : 'Unknown'));
                         console.log('Opening SumUp with URL:', sumupUrl);
                         window.location.href = sumupUrl;
                     } else {
@@ -31385,11 +31484,9 @@ class DispatchDashboard {
                 });
             }
 
-            // Handle SumUp callback (iOS and Android)
+            // Handle SumUp callback
             window.addEventListener('load', function() {
                 const urlParams = new URLSearchParams(window.location.search);
-
-                // iOS callbacks: sumup_success / sumup_fail
                 if (urlParams.has('sumup_success')) {
                     const orderId = urlParams.get('order_id');
                     alert('✅ Zahlung erfolgreich!');
@@ -31414,43 +31511,6 @@ class DispatchDashboard {
                     alert('❌ Zahlung fehlgeschlagen oder abgebrochen');
                     // Remove URL parameters
                     window.location.href = window.location.pathname;
-                }
-                // Android callback: sumup_callback with smp-status parameter
-                else if (urlParams.has('sumup_callback')) {
-                    const orderId = urlParams.get('order_id');
-                    const smpStatus = urlParams.get('smp-status');
-                    const smpMessage = urlParams.get('smp-message');
-                    const smpTxCode = urlParams.get('smp-tx-code');
-
-                    console.log('SumUp Android Callback:', { smpStatus, smpMessage, smpTxCode, orderId });
-
-                    if (smpStatus === 'success') {
-                        alert('✅ Zahlung erfolgreich!' + (smpTxCode ? ' (TX: ' + smpTxCode + ')' : ''));
-
-                        // Mark payment as received
-                        fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/x-www-form-urlencoded',
-                            },
-                            body: new URLSearchParams({
-                                action: 'mark_sumup_payment',
-                                order_id: orderId,
-                                status: 'paid',
-                                tx_code: smpTxCode || ''
-                            })
-                        })
-                        .then(() => {
-                            // Remove URL parameters and reload
-                            window.location.href = window.location.pathname;
-                        });
-                    } else {
-                        // smp-status is 'failed' or other
-                        const failureMsg = smpMessage || 'Zahlung fehlgeschlagen oder abgebrochen';
-                        alert('❌ ' + failureMsg);
-                        // Remove URL parameters
-                        window.location.href = window.location.pathname;
-                    }
                 }
             });
 
@@ -34072,7 +34132,7 @@ ${username}`);
                                 nav.innerHTML = `
                                     <a href="#bestellungen" class="nav-item active" onclick="showBestellungen()">
                                         <div class="icon">
-                                            <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                                 <path d="M8 2v3h8V2H8zM9 9l3 4 4-6 1 1.5L12 15 8 10l1-1z"/>
                                                 <path d="M19 3h-1V1h-2v2H8V1H6v2H5c-1.11 0-1.99.89-1.99 2L3 19a2 2 0 002 2h14c1.1 0 2-.9 2-2V5c0-1.11-.9-2-2-2zm0 16H5V8h14v11z"/>
                                             </svg>
@@ -34081,7 +34141,7 @@ ${username}`);
                                     </a>
                                     <a href="#karte" class="nav-item" onclick="showKarte()">
                                         <div class="icon">
-                                            <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                                 <path d="M20.5 3l-.16.03L15 5.1 9 3 3.36 4.9c-.21.07-.36.25-.36.48V20.5c0 .28.22.5.5.5l.16-.03L9 18.9l6 2.1 5.64-1.9c.21-.07.36-.25.36-.48V3.5c0-.28-.22-.5-.5-.5zM15 19l-6-2.11V5l6 2.11V19z"/>
                                             </svg>
                                         </div>
@@ -34089,7 +34149,7 @@ ${username}`);
                                     </a>
                                     <a href="#warten" class="nav-item" onclick="showWarten()">
                                         <div class="icon">
-                                            <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                                 <path d="M15 1H9v2h6V1zm-4 13h2V8h-2v6zm8.03-6.61l1.42-1.42c-.43-.51-.9-.99-1.41-1.41l-1.42 1.42C16.07 4.74 14.12 4 12 4c-4.97 0-9 4.03-9 9s4.02 9 9 9 9-4.03 9-9c0-2.12-.74-4.07-1.97-5.61zM12 20c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/>
                                             </svg>
                                         </div>
@@ -34097,7 +34157,7 @@ ${username}`);
                                     </a>
                                     <a href="#packliste" class="nav-item" onclick="showPackliste()">
                                         <div class="icon">
-                                            <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                                 <path d="M19 3h-4.18C14.4 1.84 13.3 1 12 1c-1.3 0-2.4.84-2.82 2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 0c.55 0 1 .45 1 1s-.45 1-1 1-1-.45-1-1 .45-1 1-1zm2 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z"/>
                                             </svg>
                                         </div>
@@ -34139,7 +34199,7 @@ ${username}`);
                                 nav.innerHTML = `
                                     <a href="#bestellungen" class="nav-item active" onclick="showBestellungen()">
                                         <div class="icon">
-                                            <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                                 <path d="M8 2v3h8V2H8zM9 9l3 4 4-6 1 1.5L12 15 8 10l1-1z"/>
                                                 <path d="M19 3h-1V1h-2v2H8V1H6v2H5c-1.11 0-1.99.89-1.99 2L3 19a2 2 0 002 2h14c1.1 0 2-.9 2-2V5c0-1.11-.9-2-2-2zm0 16H5V8h14v11z"/>
                                             </svg>
@@ -34148,7 +34208,7 @@ ${username}`);
                                     </a>
                                     <a href="#karte" class="nav-item" onclick="showKarte()">
                                         <div class="icon">
-                                            <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                                 <path d="M20.5 3l-.16.03L15 5.1 9 3 3.36 4.9c-.21.07-.36.25-.36.48V20.5c0 .28.22.5.5.5l.16-.03L9 18.9l6 2.1 5.64-1.9c.21-.07.36-.25.36-.48V3.5c0-.28-.22-.5-.5-.5zM15 19l-6-2.11V5l6 2.11V19z"/>
                                             </svg>
                                         </div>
@@ -34156,7 +34216,7 @@ ${username}`);
                                     </a>
                                     <a href="#warten" class="nav-item" onclick="showWarten()">
                                         <div class="icon">
-                                            <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                                 <path d="M15 1H9v2h6V1zm-4 13h2V8h-2v6zm8.03-6.61l1.42-1.42c-.43-.51-.9-.99-1.41-1.41l-1.42 1.42C16.07 4.74 14.12 4 12 4c-4.97 0-9 4.03-9 9s4.02 9 9 9 9-4.03 9-9c0-2.12-.74-4.07-1.97-5.61zM12 20c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/>
                                             </svg>
                                         </div>
@@ -34164,7 +34224,7 @@ ${username}`);
                                     </a>
                                     <a href="#packliste" class="nav-item" onclick="showPackliste()">
                                         <div class="icon">
-                                            <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                            <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                                 <path d="M19 3h-4.18C14.4 1.84 13.3 1 12 1c-1.3 0-2.4.84-2.82 2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 0c.55 0 1 .45 1 1s-.45 1-1 1-1-.45-1-1 .45-1 1-1zm2 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z"/>
                                             </svg>
                                         </div>
@@ -34472,31 +34532,31 @@ ${username}`);
                             </div>
 
                                 <!-- Mobile Bottom Menu - 4 Items -->
-                                <div style="position: fixed; bottom: 0; left: 0; right: 0; background: #2D3748; height: 56px; z-index: 9999; display: flex; align-items: center; justify-content: space-around; padding: 0 10px; border-top: 1px solid #4A5568;">
-                                    <a href="#" onclick="showBestellungen(); return false;" style="display: flex; flex-direction: column; align-items: center; justify-content: center; text-decoration: none; color: #48BB78; min-width: 60px;">
-                                        <svg style="width: 22px; height: 22px; margin-bottom: 4px;" fill="currentColor" viewBox="0 0 24 24">
+                                <div style="position: fixed; bottom: 0; left: 0; right: 0; background: #2D3748; height: 62px; z-index: 9999; display: flex; align-items: center; justify-content: space-evenly; padding: 0 10px 8px 10px; gap: 8px; border-top: 1px solid #4A5568;">
+                                    <a href="#" onclick="showBestellungen(); return false;" style="display: flex; flex-direction: column; align-items: center; justify-content: center; text-decoration: none; color: #48BB78; padding: 6px 12px;">
+                                        <svg style="width: 20px; height: 20px; margin-bottom: 4px;" fill="currentColor" viewBox="0 0 24 24">
                                             <path d="M8 2v3h8V2H8zM9 9l3 4 4-6 1 1.5L12 15 8 10l1-1z"/>
                                             <path d="M19 3h-1V1h-2v2H8V1H6v2H5c-1.11 0-1.99.89-1.99 2L3 19a2 2 0 002 2h14c1.1 0 2-.9 2-2V5c0-1.11-.9-2-2-2zm0 16H5V8h14v11z"/>
                                         </svg>
                                         <span style="font-size: 10px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px;">BESTELLUNGEN</span>
                                     </a>
 
-                                    <a href="#" onclick="showKarte(); return false;" style="display: flex; flex-direction: column; align-items: center; justify-content: center; text-decoration: none; color: #48BB78; min-width: 60px;">
-                                        <svg style="width: 22px; height: 22px; margin-bottom: 4px;" fill="currentColor" viewBox="0 0 24 24">
+                                    <a href="#" onclick="showKarte(); return false;" style="display: flex; flex-direction: column; align-items: center; justify-content: center; text-decoration: none; color: #48BB78; padding: 6px 12px;">
+                                        <svg style="width: 20px; height: 20px; margin-bottom: 4px;" fill="currentColor" viewBox="0 0 24 24">
                                             <path d="M20.5 3l-.16.03L15 5.1 9 3 3.36 4.9c-.21.07-.36.25-.36.48V20.5c0 .28.22.5.5.5l.16-.03L9 18.9l6 2.1 5.64-1.9c.21-.07.36-.25.36-.48V3.5c0-.28-.22-.5-.5-.5zM15 19l-6-2.11V5l6 2.11V19z"/>
                                         </svg>
                                         <span style="font-size: 10px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px;">KARTE</span>
                                     </a>
 
-                                    <a href="#" onclick="showWarten(); return false;" style="display: flex; flex-direction: column; align-items: center; justify-content: center; text-decoration: none; color: #48BB78; min-width: 60px;">
-                                        <svg style="width: 22px; height: 22px; margin-bottom: 4px;" fill="currentColor" viewBox="0 0 24 24">
+                                    <a href="#" onclick="showWarten(); return false;" style="display: flex; flex-direction: column; align-items: center; justify-content: center; text-decoration: none; color: #48BB78; padding: 6px 12px;">
+                                        <svg style="width: 20px; height: 20px; margin-bottom: 4px;" fill="currentColor" viewBox="0 0 24 24">
                                             <path d="M15 1H9v2h6V1zm-4 13h2V8h-2v6zm8.03-6.61l1.42-1.42c-.43-.51-.9-.99-1.41-1.41l-1.42 1.42C16.07 4.74 14.12 4 12 4c-4.97 0-9 4.03-9 9s4.02 9 9 9 9-4.03 9-9c0-2.12-.74-4.07-1.97-5.61zM12 20c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/>
                                         </svg>
                                         <span style="font-size: 10px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px;">WARTEN</span>
                                     </a>
 
-                                    <a href="#" onclick="showPackliste(); return false;" style="display: flex; flex-direction: column; align-items: center; justify-content: center; text-decoration: none; color: #48BB78; min-width: 60px;">
-                                        <svg style="width: 22px; height: 22px; margin-bottom: 4px;" fill="currentColor" viewBox="0 0 24 24">
+                                    <a href="#" onclick="showPackliste(); return false;" style="display: flex; flex-direction: column; align-items: center; justify-content: center; text-decoration: none; color: #48BB78; padding: 6px 12px;">
+                                        <svg style="width: 20px; height: 20px; margin-bottom: 4px;" fill="currentColor" viewBox="0 0 24 24">
                                             <path d="M19 3h-4.18C14.4 1.84 13.3 1 12 1c-1.3 0-2.4.84-2.82 2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 0c.55 0 1 .45 1 1s-.45 1-1 1-1-.45-1-1 .45-1 1-1zm2 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z"/>
                                         </svg>
                                         <span style="font-size: 10px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px;">PACKLISTE</span>
@@ -36111,7 +36171,7 @@ ${username}`);
                         <div class="bottom-navigation">
                             <a href="#bestellungen" class="nav-item" onclick="showBestellungen()">
                                 <div class="icon">
-                                    <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                         <path d="M8 2v3h8V2H8zM9 9l3 4 4-6 1 1.5L12 15 8 10l1-1z"/>
                                         <path d="M19 3h-1V1h-2v2H8V1H6v2H5c-1.11 0-1.99.89-1.99 2L3 19a2 2 0 002 2h14c1.1 0 2-.9 2-2V5c0-1.11-.9-2-2-2zm0 16H5V8h14v11z"/>
                                     </svg>
@@ -36120,7 +36180,7 @@ ${username}`);
                             </a>
                             <a href="#karte" class="nav-item" onclick="showKarte()">
                                 <div class="icon">
-                                    <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                         <path d="M20.5 3l-.16.03L15 5.1 9 3 3.36 4.9c-.21.07-.36.25-.36.48V20.5c0 .28.22.5.5.5l.16-.03L9 18.9l6 2.1 5.64-1.9c.21-.07.36-.25.36-.48V3.5c0-.28-.22-.5-.5-.5zM15 19l-6-2.11V5l6 2.11V19z"/>
                                     </svg>
                                 </div>
@@ -36128,7 +36188,7 @@ ${username}`);
                             </a>
                             <a href="#warten" class="nav-item active" onclick="showWarten()">
                                 <div class="icon">
-                                    <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                         <path d="M15 1H9v2h6V1zm-4 13h2V8h-2v6zm8.03-6.61l1.42-1.42c-.43-.51-.9-.99-1.41-1.41l-1.42 1.42C16.07 4.74 14.12 4 12 4c-4.97 0-9 4.03-9 9s4.02 9 9 9 9-4.03 9-9c0-2.12-.74-4.07-1.97-5.61zM12 20c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/>
                                     </svg>
                                 </div>
@@ -36136,7 +36196,7 @@ ${username}`);
                             </a>
                             <a href="#packliste" class="nav-item" onclick="showPackliste()">
                                 <div class="icon">
-                                    <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                         <path d="M19 3h-4.18C14.4 1.84 13.3 1 12 1c-1.3 0-2.4.84-2.82 2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 0c.55 0 1 .45 1 1s-.45 1-1 1-1-.45-1-1 .45-1 1-1zm2 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z"/>
                                     </svg>
                                 </div>
@@ -36387,7 +36447,7 @@ ${username}`);
                     <div class="bottom-navigation">
                         <a href="#bestellungen" class="nav-item" onclick="showBestellungen()">
                             <div class="icon">
-                    <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                         <path d="M8 2v3h8V2H8zM9 9l3 4 4-6 1 1.5L12 15 8 10l1-1z"/>
                         <path d="M19 3h-1V1h-2v2H8V1H6v2H5c-1.11 0-1.99.89-1.99 2L3 19a2 2 0 002 2h14c1.1 0 2-.9 2-2V5c0-1.11-.9-2-2-2zm0 16H5V8h14v11z"/>
                     </svg>
@@ -36396,7 +36456,7 @@ ${username}`);
                         </a>
                         <a href="#karte" class="nav-item" onclick="showKarte()">
                             <div class="icon">
-                    <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                         <path d="M20.5 3l-.16.03L15 5.1 9 3 3.36 4.9c-.21.07-.36.25-.36.48V20.5c0 .28.22.5.5.5l.16-.03L9 18.9l6 2.1 5.64-1.9c.21-.07.36-.25.36-.48V3.5c0-.28-.22-.5-.5-.5zM15 19l-6-2.11V5l6 2.11V19z"/>
                     </svg>
                 </div>
@@ -36404,7 +36464,7 @@ ${username}`);
                         </a>
                         <a href="#warten" class="nav-item active" onclick="showWarten()">
                             <div class="icon">
-                    <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                         <path d="M15 1H9v2h6V1zm-4 13h2V8h-2v6zm8.03-6.61l1.42-1.42c-.43-.51-.9-.99-1.41-1.41l-1.42 1.42C16.07 4.74 14.12 4 12 4c-4.97 0-9 4.03-9 9s4.02 9 9 9 9-4.03 9-9c0-2.12-.74-4.07-1.97-5.61zM12 20c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7 7z"/>
                     </svg>
                 </div>
@@ -36412,7 +36472,7 @@ ${username}`);
                         </a>
                         <a href="#packliste" class="nav-item" onclick="showPackliste()">
                             <div class="icon">
-                    <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                    <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                         <path d="M19 3h-4.18C14.4 1.84 13.3 1 12 1c-1.3 0-2.4.84-2.82 2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 0c.55 0 1 .45 1 1s-.45 1-1 1-1-.45-1-1 .45-1 1-1zm2 14H7v-2h7v2zm3-4H7v-2h10v2zm0-4H7V7h10v2z"/>
                     </svg>
                 </div>
@@ -36651,7 +36711,7 @@ ${username}`);
                                     <div class="bottom-navigation">
                                         <a href="#bestellungen" class="nav-item" onclick="showBestellungen()">
                                             <div class="icon">
-                                <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                     <path d="M8 2v3h8V2H8zM9 9l3 4 4-6 1 1.5L12 15 8 10l1-1z"/>
                                     <path d="M19 3h-1V1h-2v2H8V1H6v2H5c-1.11 0-1.99.89-1.99 2L3 19a2 2 0 002 2h14c1.1 0 2-.9 2-2V5c0-1.11-.9-2-2-2zm0 16H5V8h14v11z"/>
                                 </svg>
@@ -36660,7 +36720,7 @@ ${username}`);
                                         </a>
                                         <a href="#karte" class="nav-item" onclick="showKarte()">
                                             <div class="icon">
-                                <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                     <path d="M20.5 3l-.16.03L15 5.1 9 3 3.36 4.9c-.21.07-.36.25-.36.48V20.5c0 .28.22.5.5.5l.16-.03L9 18.9l6 2.1 5.64-1.9c.21-.07.36-.25.36-.48V3.5c0-.28-.22-.5-.5-.5zM15 19l-6-2.11V5l6 2.11V19z"/>
                                 </svg>
                             </div>
@@ -36668,7 +36728,7 @@ ${username}`);
                                         </a>
                                         <a href="#warten" class="nav-item" onclick="showWarten()">
                                             <div class="icon">
-                                <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                     <path d="M15 1H9v2h6V1zm-4 13h2V8h-2v6zm8.03-6.61l1.42-1.42c-.43-.51-.9-.99-1.41-1.41l-1.42 1.42C16.07 4.74 14.12 4 12 4c-4.97 0-9 4.03-9 9s4.02 9 9 9 9-4.03 9-9c0-2.12-.74-4.07-1.97-5.61zM12 20c-3.87 0-7-3.13-7-7s3.13-7 7-7 7 3.13 7 7-3.13 7-7z"/>
                                 </svg>
                             </div>
@@ -36676,7 +36736,7 @@ ${username}`);
                                         </a>
                                         <a href="#leistung" class="nav-item active" onclick="showLeistung()">
                                             <div class="icon">
-                                <svg width="18" height="18" fill="currentColor" viewBox="0 0 24 24">
+                                <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                     <path d="M2,2V4H4V20A2,2 0 0,0 6,22H18A2,2 0 0,0 20,20V4H22V2H2M6,4H18V20H6V4M8,6V18H10V6H8M12,6V18H14V6H12M16,6V18H18V6H16Z"/>
                                 </svg>
                             </div>
@@ -38972,13 +39032,96 @@ Ihr Lieferteam',
             }
         }
         
+        // ALSO get unassigned orders for the selected date
+        $unassigned_orders = [];
+        $unassigned_args = [
+            'limit' => -1,
+            'status' => ['processing', 'on-hold', 'pending'],
+            'meta_query' => [
+                'relation' => 'OR',
+                [
+                    'key' => '_assigned_driver',
+                    'compare' => 'NOT EXISTS'
+                ],
+                [
+                    'key' => '_assigned_driver',
+                    'value' => '',
+                    'compare' => '='
+                ],
+                [
+                    'key' => '_assigned_driver',
+                    'value' => '0',
+                    'compare' => '='
+                ]
+            ]
+        ];
+
+        $all_unassigned = wc_get_orders($unassigned_args);
+
+        // Filter unassigned orders by delivery date
+        foreach ($all_unassigned as $order) {
+            $delivery_date_str = $order->get_meta('Gewünschtes Lieferdatum')
+                              ?: $order->get_meta('Lieferdatum')
+                              ?: $order->get_meta('_delivery_date');
+
+            $include_order = false;
+
+            if (empty($delivery_date_str)) {
+                // No delivery date - show if created today
+                $order_date = $order->get_date_created();
+                if ($order_date && $order_date->format('Y-m-d') === $selected_date_ymd) {
+                    $include_order = true;
+                }
+            } else {
+                // Parse delivery date
+                $delivery_date_obj = $this->parseDeliveryDate($delivery_date_str);
+                if ($delivery_date_obj && $delivery_date_obj->format('Y-m-d') === $selected_date_ymd) {
+                    $include_order = true;
+                }
+            }
+
+            if ($include_order) {
+                // Get coordinates
+                $lat = $order->get_meta('lpac_latitude') ?: $order->get_meta('_shipping_latitude');
+                $lng = $order->get_meta('lpac_longitude') ?: $order->get_meta('_shipping_longitude');
+
+                $unassigned_orders[] = [
+                    'id' => $order->get_id(),
+                    'number' => $order->get_order_number(),
+                    'customer' => $order->get_billing_first_name() . ' ' . $order->get_billing_last_name(),
+                    'address' => $order->get_shipping_address_1() ?: $order->get_billing_address_1(),
+                    'city' => $order->get_shipping_city() ?: $order->get_billing_city(),
+                    'postcode' => $order->get_shipping_postcode() ?: $order->get_billing_postcode(),
+                    'status' => $order->get_status(),
+                    'delivery_date' => $delivery_date_str,
+                    'latitude' => floatval($lat),
+                    'longitude' => floatval($lng),
+                    'has_coordinates' => !empty($lat) && !empty($lng)
+                ];
+            }
+        }
+
+        // Get depot coordinates and color
+        $depot_lat = floatval(get_option('dispatch_depot_latitude', 0));
+        $depot_lng = floatval(get_option('dispatch_depot_longitude', 0));
+        $depot_name = get_option('dispatch_default_depot_name', 'Depot');
+        $depot_address = get_option('dispatch_default_depot_address', '');
+
         wp_send_json_success([
             'drivers' => $driver_data,
+            'unassigned_orders' => $unassigned_orders,
+            'depot' => [
+                'name' => $depot_name,
+                'address' => $depot_address,
+                'latitude' => $depot_lat,
+                'longitude' => $depot_lng
+            ],
             'stats' => [
                 'total_routes' => $total_routes,
                 'total_deliveries' => $total_deliveries,
                 'active_drivers' => $active_drivers,
-                'estimated_time' => $estimated_time . ' min'
+                'estimated_time' => $estimated_time . ' min',
+                'unassigned_count' => count($unassigned_orders)
             ],
             'date' => $selected_date
         ]);
@@ -39211,9 +39354,13 @@ Ihr Lieferteam',
             $accuracy = 0;
             $source = 'none';
 
-            // Try Traccar first
+            // Try Traccar first - v2.9.77: Fixed meta key name
             if ($use_traccar) {
-                $traccar_device_id = get_user_meta($driver->ID, 'traccar_device_id', true);
+                // Try both meta key formats for compatibility
+                $traccar_device_id = get_user_meta($driver->ID, '_traccar_device_id', true);
+                if (empty($traccar_device_id)) {
+                    $traccar_device_id = get_user_meta($driver->ID, 'traccar_device_id', true);
+                }
 
                 if ($traccar_device_id && isset($traccar_positions[$traccar_device_id])) {
                     $position = $traccar_positions[$traccar_device_id];
@@ -39318,8 +39465,10 @@ Ihr Lieferteam',
                 continue;
             }
 
-            // Traccar Device-ID in User Meta speichern (für spätere Referenz)
+            // Traccar Device-ID in User Meta speichern - BEIDE Keys (v2.9.82)
+            update_user_meta($driver_id, '_traccar_device_id', $device['id']);
             update_user_meta($driver_id, 'traccar_device_id', $device['id']);
+            update_user_meta($driver_id, '_traccar_unique_id', $device['uniqueId']);
             update_user_meta($driver_id, 'traccar_unique_id', $device['uniqueId']);
 
             // Prüfen ob Device eine Position hat
@@ -39862,8 +40011,8 @@ Ihr Lieferteam',
      */
     private function plusCodeToCoordinates(string $plus_code): ?array {
         try {
-            // Validate Plus Code format
-            if (empty($plus_code) || !preg_match('/^[23456789CFGHJMPQRVWX]{4,8}\+[23456789CFGHJMPQRVWX]{2,3}$/', $plus_code)) {
+            // Validate Plus Code format (strict: exactly 8 characters before +)
+            if (empty($plus_code) || !preg_match('/^[23456789CFGHJMPQRVWX]{8}\+[23456789CFGHJMPQRVWX]{2,}$/', $plus_code)) {
                 error_log("plusCodeToCoordinates: Invalid Plus Code format: {$plus_code}");
                 return null;
             }
@@ -39897,16 +40046,6 @@ Ihr Lieferteam',
             error_log('plusCodeToCoordinates: Exception - ' . $e->getMessage());
             return null;
         }
-    }
-
-    /**
-     * Decode Plus Code to coordinates (alias for plusCodeToCoordinates)
-     *
-     * @param string $plus_code Plus Code string
-     * @return array|null Array with 'lat' and 'lng' keys, or null on failure
-     */
-    private function decodePlusCode(string $plus_code): ?array {
-        return $this->plusCodeToCoordinates($plus_code);
     }
 
     /**
@@ -40040,13 +40179,7 @@ Ihr Lieferteam',
     }
 
     /**
-     * Ensure Plus Code exists for order AND calculate distance/ETA
-     *
-     * Logic:
-     * 1. Check if Plus Code exists in user profile
-     * 2. ALWAYS calculate distance/ETA when coordinates are available
-     * 3. If no Plus Code in profile: check shipping address, then billing address
-     * 4. If address deviates >100m from profile Plus Code: warn admin
+     * Ensure Plus Code exists for order
      */
     public function ensurePlusCodeForOrder($order_id): void {
         $order = wc_get_order($order_id);
@@ -40055,202 +40188,27 @@ Ihr Lieferteam',
             return;
         }
 
-        $user_id = $order->get_customer_id();
-        $coordinates = null;
-        $plus_code = null;
-        $plus_code_source = null;
+        // Check if we already have a Plus Code
+        $plus_code = $this->getOrderPlusCode($order);
 
-        // ========================================
-        // STEP 1: Check Plus Code in user profile
-        // ========================================
-        if ($user_id) {
-            $user_plus_code = get_user_meta($user_id, 'billing_pluscode', true);
-            if (empty($user_plus_code)) {
-                $user_plus_code = get_user_meta($user_id, 'plus_code', true);
-            }
-
-            if (!empty($user_plus_code) && $user_plus_code !== 'NONE') {
-                $plus_code = $user_plus_code;
-                $plus_code_source = 'user_profile';
-
-                // Decode Plus Code to coordinates
-                $decoded = $this->decodePlusCode($user_plus_code);
-                if ($decoded) {
-                    $coordinates = [
-                        'lat' => $decoded['lat'],
-                        'lng' => $decoded['lng']
-                    ];
-                }
-
-                error_log("ensurePlusCodeForOrder: Order #{$order_id} - Using Plus Code from user profile: {$plus_code}");
-            }
-        }
-
-        // ========================================
-        // STEP 2: Collect coordinates from order (for distance calc and deviation check)
-        // ========================================
-        $order_lat = $order->get_meta('billing_latitude') ?: $order->get_meta('lpac_latitude');
-        $order_lng = $order->get_meta('billing_longitude') ?: $order->get_meta('lpac_longitude');
-
-        // Fallback: delivery_coordinates JSON
-        if (empty($order_lat) || empty($order_lng)) {
-            $coords_json = $order->get_meta('delivery_coordinates');
-            if (is_array($coords_json)) {
-                $order_lat = $coords_json['lat'] ?? '';
-                $order_lng = $coords_json['lng'] ?? '';
-            }
-        }
-
-        $order_coordinates = null;
-        if (!empty($order_lat) && !empty($order_lng)) {
-            $order_coordinates = ['lat' => floatval($order_lat), 'lng' => floatval($order_lng)];
-        }
-
-        // ========================================
-        // STEP 3: If no Plus Code from profile, try to get/generate from order
-        // ========================================
-        if (empty($plus_code)) {
-            // Check order meta for existing Plus Code
-            $order_plus_code = $order->get_meta('_billing_plus_code') ?: $order->get_meta('billing_pluscode');
-
-            if (!empty($order_plus_code) && $order_plus_code !== 'NONE') {
-                $plus_code = $order_plus_code;
-                $plus_code_source = 'order_meta';
-            } elseif ($order_coordinates) {
-                // Generate Plus Code from order coordinates
-                $generated = $this->generatePlusCodeFromCoordinates($order_coordinates['lat'], $order_coordinates['lng']);
-                if ($generated) {
-                    $plus_code = $generated;
-                    $plus_code_source = 'generated_from_order_coords';
-                }
-            }
-
-            // Use order coordinates if we don't have profile coordinates
-            if (!$coordinates && $order_coordinates) {
-                $coordinates = $order_coordinates;
-            }
-        }
-
-        // ========================================
-        // STEP 4: ALWAYS calculate distance/ETA if coordinates available
-        // ========================================
-        // Use order_coordinates if coordinates from Plus Code is empty
-        $calc_coordinates = $coordinates ?: $order_coordinates;
-
-        // Check multiple possible distance fields
-        $existing_distance = $order->get_meta('lpac_customer_distance')
-            ?: $order->get_meta('_delivery_distance_km')
-            ?: $order->get_meta('_route_distance');
-
-        if (empty($existing_distance) && $calc_coordinates) {
-            // Get depot coordinates
-            $settings = $this->getSettings();
-            $depot_lat = $settings['depot_latitude'] ?? get_option('dispatch_depot_latitude', '39.4887003');
-            $depot_lng = $settings['depot_longitude'] ?? get_option('dispatch_depot_longitude', '2.8970119');
-
-            if ($depot_lat && $depot_lng) {
-                $route_data = $this->calculateDrivingDistance(
-                    floatval($depot_lat),
-                    floatval($depot_lng),
-                    $calc_coordinates['lat'],
-                    $calc_coordinates['lng'],
-                    $order_id
-                );
-
-                if ($route_data && isset($route_data['distance_km'])) {
-                    // Save to all commonly used meta keys for compatibility
-                    $distance_km = round($route_data['distance_km'], 1);
-                    $eta_minutes = round($route_data['duration_minutes']);
-
-                    $order->update_meta_data('lpac_customer_distance', $distance_km);
-                    $order->update_meta_data('lpac_customer_distance_unit', 'km');
-                    $order->update_meta_data('lpac_customer_distance_duration', $eta_minutes . ' mins');
-                    $order->update_meta_data('_delivery_distance_km', $distance_km);
-                    $order->update_meta_data('_delivery_eta_minutes', $eta_minutes);
-                    $order->update_meta_data('_route_distance', $distance_km);
-                    $order->update_meta_data('_route_duration', $eta_minutes);
-                    $order->update_meta_data('_dispatch_distance_calculated', 'yes');
-
-                    error_log("ensurePlusCodeForOrder: Order #{$order_id} - Distance calculated: {$distance_km} km, ETA: {$eta_minutes} mins");
-                }
-            }
-        }
-
-        // ========================================
-        // STEP 5: Address deviation check (>100m warning)
-        // ========================================
-        if ($user_id && $coordinates && $order_coordinates) {
-            // Only check if we have both profile coordinates and order coordinates
-            $user_plus_code = get_user_meta($user_id, 'billing_pluscode', true) ?: get_user_meta($user_id, 'plus_code', true);
-
-            if (!empty($user_plus_code) && $user_plus_code !== 'NONE') {
-                $profile_coords = $this->decodePlusCode($user_plus_code);
-
-                if ($profile_coords) {
-                    // Calculate deviation in meters using Haversine formula
-                    $deviation_km = $this->calculateHaversineDistance(
-                        $profile_coords['lat'],
-                        $profile_coords['lng'],
-                        $order_coordinates['lat'],
-                        $order_coordinates['lng']
-                    );
-                    $deviation_meters = $deviation_km * 1000;
-
-                    if ($deviation_meters > 100) {
-                        // Address deviation > 100m - warn admin
-                        $order->update_meta_data('_address_deviation_warning', 'yes');
-                        $order->update_meta_data('_address_deviation_meters', round($deviation_meters));
-
-                        $warning_note = sprintf(
-                            '⚠️ ADRESS-ABWEICHUNG: Die Lieferadresse weicht um %d Meter vom hinterlegten Plus Code im Kundenprofil ab. Bitte prüfen!',
-                            round($deviation_meters)
-                        );
-                        $order->add_order_note($warning_note);
-
-                        error_log("ensurePlusCodeForOrder: Order #{$order_id} - ADDRESS DEVIATION WARNING: {$deviation_meters}m from profile Plus Code");
-                    }
-                }
-            }
-        }
-
-        // ========================================
-        // STEP 6: Save Plus Code to order
-        // ========================================
         if (!empty($plus_code)) {
-            $order->update_meta_data('_billing_plus_code', $plus_code);
-            $order->update_meta_data('plus_code_source', $plus_code_source);
+            return;
         }
 
-        // Save all changes
-        $order->save();
+        // Try to get from coordinates
+        $latitude = $order->get_meta('lpac_latitude');
+        $longitude = $order->get_meta('lpac_longitude');
+
+        if ($latitude && $longitude) {
+            $generated_plus_code = $this->generatePlusCodeFromCoordinates($latitude, $longitude);
+
+            if ($generated_plus_code) {
+                $order->update_meta_data('_billing_plus_code', $generated_plus_code);
+                $order->update_meta_data('plus_code_source', 'generated_from_coords');
+                $order->save();
+            }
+        }
     }
-
-    /**
-     * Calculate distance between two coordinates using Haversine formula
-     *
-     * @param float $lat1 First latitude
-     * @param float $lng1 First longitude
-     * @param float $lat2 Second latitude
-     * @param float $lng2 Second longitude
-     * @return float Distance in kilometers
-     */
-    private function calculateHaversineDistance($lat1, $lng1, $lat2, $lng2): float {
-        $earth_radius = 6371; // km
-
-        $lat1_rad = deg2rad($lat1);
-        $lat2_rad = deg2rad($lat2);
-        $delta_lat = deg2rad($lat2 - $lat1);
-        $delta_lng = deg2rad($lng2 - $lng1);
-
-        $a = sin($delta_lat / 2) * sin($delta_lat / 2) +
-             cos($lat1_rad) * cos($lat2_rad) *
-             sin($delta_lng / 2) * sin($delta_lng / 2);
-
-        $c = 2 * atan2(sqrt($a), sqrt(1 - $a));
-
-        return $earth_radius * $c;
-    }
-
     /**
      * AUTO-FIX: Calculate KM/ETA if coordinates exist but distance is missing
      * Called from clearCacheForUpdatedOrder to ensure KM/ETA is always calculated
@@ -40289,7 +40247,7 @@ Ihr Lieferteam',
 
             // Decode Plus Code if valid (must contain '+' and not be 'NONE')
             if (!empty($user_plus_code) && $user_plus_code !== 'NONE' && $user_plus_code !== 'none' && strpos($user_plus_code, '+') !== false) {
-                $coords = $this->decodePlusCode($user_plus_code);
+                $coords = $this->plusCodeToCoordinates($user_plus_code);
                 if ($coords) {
                     $customer_lat = $coords['lat'];
                     $customer_lng = $coords['lng'];
@@ -40340,7 +40298,7 @@ Ihr Lieferteam',
         // ========================================
         if (!empty($user_plus_code) && $coord_source !== 'user_profile') {
             // We have profile Plus Code but used address coordinates
-            $profile_coords = $this->decodePlusCode($user_plus_code);
+            $profile_coords = $this->plusCodeToCoordinates($user_plus_code);
             if ($profile_coords && !empty($customer_lat) && !empty($customer_lng)) {
                 $deviation_m = $this->calculateHaversineDistance(
                     $profile_coords['lat'], $profile_coords['lng'],
@@ -40359,6 +40317,7 @@ Ihr Lieferteam',
 
         // Still no coordinates? Nothing to calculate
         if (empty($customer_lat) || empty($customer_lng)) {
+            error_log("maybeCalculateDistanceForOrder: Order #{$order_id} - No coordinates found, skipping");
             return;
         }
 
@@ -40397,7 +40356,7 @@ Ihr Lieferteam',
                 $order->update_meta_data('_dispatch_distance_calculated_at', current_time('mysql'));
                 $order->save();
 
-                error_log("✅ AUTO-FIX (OSRM): Order #{$order_id} - KM/ETA calculated: {$distance_km} km / {$eta_minutes} mins");
+                error_log("✅ AUTO-FIX (OSRM): Order #{$order_id} - KM/ETA calculated: {$distance_km} km / {$eta_minutes} mins (source: {$coord_source})");
                 return;
             }
         }
@@ -40420,7 +40379,7 @@ Ihr Lieferteam',
         $order->update_meta_data('_dispatch_distance_calculated_at', current_time('mysql'));
         $order->save();
 
-        error_log("✅ AUTO-FIX (Haversine): Order #{$order_id} - KM/ETA calculated: " . round($distance_km, 1) . " km / {$eta_minutes} mins");
+        error_log("✅ AUTO-FIX (Haversine): Order #{$order_id} - KM/ETA calculated: " . round($distance_km, 1) . " km / {$eta_minutes} mins (source: {$coord_source})");
     }
 
     /**
@@ -40518,6 +40477,7 @@ Ihr Lieferteam',
         // This ensures KM/ETA is calculated when Plus Code is added later by admin
         // ========================================
         $this->maybeCalculateDistanceForOrder($order);
+
 
         // ========================================
         // DEBUG: Track which hook called this and check suppression
@@ -41165,8 +41125,11 @@ Ihr Lieferteam',
             return;
         }
 
-        // Verify tracking code (order_key)
-        if ($order->get_order_key() !== $tracking_code) {
+        // Verify tracking code (accepts both _tracking_token AND order_key for compatibility)
+        $tracking_token = $order->get_meta('_tracking_token');
+        $order_key = $order->get_order_key();
+
+        if ($tracking_code !== $tracking_token && $tracking_code !== $order_key) {
             wp_die('Ungültiger Tracking-Code', 'Tracking-Fehler', ['response' => 403]);
             return;
         }
@@ -41224,72 +41187,90 @@ Ihr Lieferteam',
 
         // Get delivery address coordinates (5-tier priority)
         // PRIORITY 1 (HIGHEST): Plus Code from USER PROFILE (Stammkunde)
+        // Regular customers have their Plus Code stored in user meta - this ALWAYS takes priority
         $customer_lat = null;
         $customer_lng = null;
-        $profile_customer_id = $order->get_customer_id();
+        $customer_id = $order->get_customer_id();
 
-        if ($profile_customer_id > 0) {
-            $user_plus_code = get_user_meta($profile_customer_id, 'plus_code', true);
+        if ($customer_id > 0) {
+            $user_plus_code = get_user_meta($customer_id, 'plus_code', true);
             if (!empty($user_plus_code)) {
                 $coords = $this->plusCodeToCoordinates($user_plus_code);
                 if ($coords) {
                     $customer_lat = $coords['lat'];
                     $customer_lng = $coords['lng'];
+                    error_log("renderCustomerTracking: Order #{$order_id} - Using Plus Code from USER PROFILE: {$user_plus_code}");
                 }
             }
         } else {
-            $guest_email = $order->get_billing_email();
-            if (!empty($guest_email)) {
-                $guest_user = get_user_by('email', $guest_email);
-                if ($guest_user) {
-                    $user_plus_code = get_user_meta($guest_user->ID, 'plus_code', true);
+            // Guest order - try to find user by email
+            $email = $order->get_billing_email();
+            if (!empty($email)) {
+                $user = get_user_by('email', $email);
+                if ($user) {
+                    $user_plus_code = get_user_meta($user->ID, 'plus_code', true);
                     if (!empty($user_plus_code)) {
                         $coords = $this->plusCodeToCoordinates($user_plus_code);
                         if ($coords) {
                             $customer_lat = $coords['lat'];
                             $customer_lng = $coords['lng'];
+                            error_log("renderCustomerTracking: Order #{$order_id} - Guest order, using Plus Code from user profile (found by email): {$user_plus_code}");
                         }
                     }
                 }
             }
         }
 
-        // Priority 2: LPAC coordinates
+        // Priority 2: LPAC coordinates (if no user profile Plus Code)
         if (empty($customer_lat) || empty($customer_lng)) {
             $customer_lat = $order->get_meta('lpac_latitude');
             $customer_lng = $order->get_meta('lpac_longitude');
+            if (!empty($customer_lat) && !empty($customer_lng)) {
+                error_log("renderCustomerTracking: Order #{$order_id} - Using LPAC coordinates");
+            }
         }
 
-        // Priority 3: Shipping coordinates
+        // Priority 3: Shipping coordinates (from geocoding/manual entry)
         if (empty($customer_lat) || empty($customer_lng)) {
             $customer_lat = $order->get_meta('_shipping_latitude');
             $customer_lng = $order->get_meta('_shipping_longitude');
+            if (!empty($customer_lat) && !empty($customer_lng)) {
+                error_log("renderCustomerTracking: Order #{$order_id} - Using Shipping coordinates");
+            }
         }
 
-        // Priority 4: Billing coordinates
+        // Priority 4: Billing coordinates (fallback)
         if (empty($customer_lat) || empty($customer_lng)) {
             $customer_lat = $order->get_meta('billing_latitude');
             $customer_lng = $order->get_meta('billing_longitude');
+            if (!empty($customer_lat) && !empty($customer_lng)) {
+                error_log("renderCustomerTracking: Order #{$order_id} - Using Billing coordinates");
+            }
         }
 
-        // Priority 5: Plus Code from order meta or address
+        // Priority 5 (LOWEST): Plus Code from order meta fields or address
         if (empty($customer_lat) || empty($customer_lng)) {
+            // Try Plus Code from meta fields first
             $plus_code = $order->get_meta('plus_code') ?: $order->get_meta('_billing_plus_code') ?: $order->get_meta('_shipping_plus_code');
 
+            // If no Plus Code in meta, try to extract from address
             if (empty($plus_code)) {
                 $address_1 = $order->get_shipping_address_1();
                 if (preg_match('/([23456789CFGHJMPQRVWX]{4,8}\+[23456789CFGHJMPQRVWX]{2,3})/i', $address_1, $matches)) {
                     $plus_code = strtoupper($matches[1]);
+                    // Save Plus Code to meta for future use
                     $order->update_meta_data('_shipping_plus_code', $plus_code);
                     $order->save();
                 }
             }
 
+            // Decode Plus Code to coordinates
             if (!empty($plus_code)) {
                 $coords = $this->plusCodeToCoordinates($plus_code);
                 if ($coords) {
                     $customer_lat = $coords['lat'];
                     $customer_lng = $coords['lng'];
+                    error_log("renderCustomerTracking: Order #{$order_id} - Using Plus Code from order meta/address: {$plus_code}");
                 }
             }
         }
@@ -41761,6 +41742,22 @@ Ihr Lieferteam',
                     .then(data => {
                         console.log('Driver location response:', data);
 
+                        // v2.9.80: Check if order was delivered - reload page to show delivered state
+                        if (data.success && data.data.order_delivered) {
+                            console.log('Order has been delivered! Reloading page...');
+                            // Show brief message before reload
+                            const etaDisplay = document.getElementById('eta-display');
+                            if (etaDisplay) {
+                                etaDisplay.innerHTML = '✅ <strong>Zugestellt!</strong>';
+                                etaDisplay.style.color = '#10b981';
+                            }
+                            // Reload page after short delay to show delivered state
+                            setTimeout(() => {
+                                window.location.reload();
+                            }, 1500);
+                            return;
+                        }
+
                         if (data.success && data.data.latitude && data.data.longitude) {
                             currentDriverLat = parseFloat(data.data.latitude);
                             currentDriverLng = parseFloat(data.data.longitude);
@@ -41913,12 +41910,21 @@ Ihr Lieferteam',
                             // Update ETA display
                             const etaDisplay = document.getElementById('eta-display');
 
+                            // ✅ FIX: Calculate actual straight-line distance to customer
+                            const actualDistance = calculateDistance(currentDriverLat, currentDriverLng, customerLat, customerLng);
+                            console.log('  - Actual distance to customer:', actualDistance.toFixed(2), 'km');
 
-                            // Check if driver has arrived (< 1 minute AND within 150 meters)
-                            const directDistance = calculateDistance(currentDriverLat, currentDriverLng, customerLat, customerLng);
-                            if (totalETA <= 1 && directDistance < 0.15) { // 0.15 km = 150 meters
+                            // ✅ "Angekommen" only if BOTH conditions met:
+                            // 1. ETA <= 1 minute AND
+                            // 2. Distance < 200 meters (0.2 km)
+                            if (totalETA <= 1 && actualDistance < 0.2) {
                                 etaDisplay.textContent = 'Angekommen';
                                 etaDisplay.style.color = '#10b981';
+                                etaDisplay.style.fontWeight = '600';
+                            } else if (totalETA <= 5 && actualDistance < 0.5) {
+                                // Driver very close but not quite there yet
+                                etaDisplay.textContent = `Gleich da (~${totalETA} Min.)`;
+                                etaDisplay.style.color = '#f59e0b'; // Orange
                                 etaDisplay.style.fontWeight = '600';
                             } else if (totalETA < 60) {
                                 etaDisplay.textContent = `~${totalETA} Minuten`;
@@ -43687,6 +43693,12 @@ Ihr Lieferteam',
             $order->save();
 
             // Clear caches
+            // NEW v2.9.75: Optionally notify next customer
+            $driver_id = get_current_user_id();
+            if (method_exists($this, 'notifyNextCustomerAfterDelivery')) {
+                $this->notifyNextCustomerAfterDelivery($order_id, $driver_id);
+            }
+
             $this->clearAllOrderCaches();
 
             wp_send_json_success([
@@ -44091,7 +44103,7 @@ Ihr Lieferteam',
     /**
      * Schedule rating email when order is marked as delivered
      */
-    public function scheduleRatingEmail($order_id, $old_status, $new_status, $order): void {
+    public function scheduleRatingEmail(int $order_id, string $old_status, string $new_status, \WC_Order $order): void {
         if ($new_status !== 'delivered') {
             error_log("Rating email NOT sent for order #{$order_id} - Status is '{$new_status}', not 'delivered'");
             return;
@@ -44106,10 +44118,10 @@ Ihr Lieferteam',
         // Generate token
         $token = wp_generate_password(32, false);
         $order->update_meta_data('_rating_token', $token);
-        $order->update_meta_data('_rating_email_sent', 'yes');
         $order->save();
 
         // Send email immediately (no more scheduling/waiting)
+        // Note: The email class will set _rating_email_sent after successful sending
         error_log("📧 Sending rating email immediately for order #{$order_id}");
         $this->sendScheduledRatingEmail($order_id);
     }
