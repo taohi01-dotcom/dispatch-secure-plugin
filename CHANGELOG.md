@@ -4,6 +4,48 @@ Alle wichtigen Änderungen am Dispatch SECURE Plugin werden hier dokumentiert.
 
 ---
 
+## [2.9.86] - 2025-12-12
+
+### 🐛 BUGFIX: OpenLocationCode Fatal Error in class-dispatch-orders-manager.php
+
+#### ❌ Problem
+- Fatal Error: `Non-static method OpenLocationCode\OpenLocationCode::decode() cannot be called statically`
+- Trat bei `ajax_get_driver_delivery_locations()` auf (Zeile 757)
+- Fehler seit 11. Dezember 2025 im debug.log
+
+#### 🔍 Ursache
+- Die Library `vectorial1024/open-location-code-php` hat einen **privaten Konstruktor**
+- `decode()` ist eine **Instanz-Methode**, keine statische Methode
+- Der alte Code versuchte statischen Aufruf: `OpenLocationCode::decode($plus_code)`
+
+#### ✅ Lösung
+
+**Alt (falsch):**
+```php
+$decoded = \OpenLocationCode\OpenLocationCode::decode($plus_code);
+$lat = floatval($decoded->latitudeCenter);
+$lng = floatval($decoded->longitudeCenter);
+```
+
+**Neu (korrekt):**
+```php
+$olc = \OpenLocationCode\OpenLocationCode::createFromCode($plus_code);
+$decoded = $olc->decode();
+$lat = floatval($decoded->getCenterLatitude());
+$lng = floatval($decoded->getCenterLongitude());
+```
+
+#### 📚 Dokumentation
+- Library: [vectorial1024/open-location-code-php](https://github.com/Vectorial1024/open-location-code-php)
+- `createFromCode()` erstellt eine Instanz
+- `decode()` gibt ein `CodeArea` Objekt zurück
+- `getCenterLatitude()` / `getCenterLongitude()` sind Methoden, keine Properties
+
+#### 📁 Geänderte Dateien
+- `includes/class-dispatch-orders-manager.php` (Zeile 756-760)
+
+---
+
 ## [2.9.85] - 2025-12-12
 
 ### 🔧 FIX: Auto KM/ETA Berechnung bei Order-Updates
