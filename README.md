@@ -35,6 +35,16 @@ WordPress/WooCommerce Plugin für Lieferfahrer-Management, Routing und Kundenben
 - E-Mails werden weiterhin versendet
 - Automatischer Ablauf nach 60 Sekunden
 
+
+### GPS Tracking & Plus Code System (v3.1.1)
+- **Traccar GPS Integration** für Echtzeit-Fahrer-Tracking
+- **Plus Code Support** für präzise Lieferortbestimmung
+- **Gespeicherte Adressen** - Admin kann LPAC-Adressen mit einem Klick anwenden
+- **Automatische KM/ETA-Berechnung** via OSRM oder Haversine
+- **QR-Code Generator** für einfache Fahrer-App-Konfiguration
+
+📖 **[Ausführliche Dokumentation: GPS Tracking & Plus Code](DOCS-GPS-TRACKING-PLUSCODE.md)**
+
 ## Installation
 
 1. Upload nach `wp-content/plugins/dispatch-secure-270/`
@@ -54,7 +64,7 @@ Siehe [DISTRIBUTION-ANLEITUNG.md](DISTRIBUTION-ANLEITUNG.md) für Details zur Pl
 
 ## Version
 
-Aktuelle Version: **3.1.0** (2025-11-21) - Plus Code LPAC-Kompatibilität
+Aktuelle Version: **3.1.1** (2025-12-16) - Gespeicherte Adressen Plus Code Integration
 
 ## Changelog
 
