@@ -4,6 +4,50 @@ Alle wichtigen Änderungen am Dispatch SECURE Plugin werden hier dokumentiert.
 
 ---
 
+## [2.9.87] - 2026-01-15
+
+### Navigation: Plus Code Priorisierung im Fahrer-Dashboard
+
+#### Problem
+- Navigation verwendete immer `customer_address` (Straßenadresse)
+- Plus Codes wurden ignoriert, obwohl sie präziser sind
+- Bei unvollständigen Adressen führte Navigation zu falschen Standorten
+- Google Maps Intent auf Android hatte Probleme mit Plus Codes
+
+#### Ursache
+- `openNavigation()` Aufrufe verwendeten nur `order.customer_address`
+- `openNavigationDirect()` unterschied nicht zwischen Adresse und Plus Code
+- Android Intent `google.navigation:q=` funktioniert nicht zuverlässig mit Plus Codes
+
+#### Lösung
+
+**1. openNavigation Aufrufe (4 Stellen):**
+
+```javascript
+// ALT:
+openNavigation('${order.customer_address}', depotAddress)
+
+// NEU:
+openNavigation('${order.plus_code || order.customer_address}', depotAddress)
+```
+
+**Geänderte Zeilen:**
+- Zeile 3814: Bestellkarte Navigation-Icon
+- Zeile 4311: Aktive Bestellung Button
+- Zeile 8191: Order Details Modal
+- Zeile 13147: Route-Ansicht Navigation
+
+**2. openNavigationDirect() Funktion (Zeile 12591):**
+
+- Plus Code Erkennung via Regex
+- Bei Plus Code: URL-Format statt Android Intent
+- Verbesserte Plattform-Erkennung (iOS/Android/Desktop)
+
+#### Geänderte Dateien
+- `templates/driver/dashboard.php`
+
+---
+
 ## [2.9.86] - 2025-12-12
 
 ### 🐛 BUGFIX: OpenLocationCode Fatal Error in class-dispatch-orders-manager.php
