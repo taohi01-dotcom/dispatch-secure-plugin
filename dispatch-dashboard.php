@@ -1,13 +1,66 @@
 <?php
 /**
- * Plugin Name: Dispatch SECURE v2.9.85
+ * Plugin Name: Dispatch SECURE v2.9.95
  * Plugin URI: https://your-domain.de
- * Description: Auto KM/ETA Berechnung bei Order-Updates (Fix maybeCalculateDistanceForOrder)
- * Version: 2.9.85
+ * Description: Online-Status Marker Fix für Routing-Karte
+ * Version: 2.9.93
  * Author: Ihr Name
  * License: GPL v2 or later
  * Requires PHP: 8.3
  * Requires at least: 6.0
+ *
+ * ROUTING ONLINE-STATUS FIX v2.9.93 (2025-12-24):
+ * - FIXED: Online-Fahrer wurden fälschlicherweise mit gestricheltem Marker dargestellt
+ * - FIXED: ajaxGetRoutingData() gibt jetzt 'online_status' statt 'status' zurück
+ * - RESULT: Routing-Karte zeigt jetzt korrekt solid Marker für online Fahrer
+ * - RESULT: Info-Popup zeigt korrekten Online/Offline Status
+ *
+ * FAHRER-FARBEN SYNC FIX v2.9.92 (2025-12-19):
+ * - FIXED: Fahrer-Seite und Routing-Karte verwenden jetzt den gleichen Hash-Algorithmus
+ * - FIXED: Farben stimmen jetzt überein zwischen beiden Ansichten
+ *
+ * INDIVIDUELLE FAHRER-FARBEN v2.9.91 (2025-12-19):
+ * - ADDED: Farbwähler für jeden Fahrer auf der Fahrer-Seite
+ * - ADDED: Farben werden in User Meta gespeichert (dispatch_driver_color)
+ * - ADDED: AJAX Handler zum Speichern der Farben
+ * - CHANGED: getDriverColor() verwendet jetzt zuerst custom colors, dann Hash-Fallback
+ * - CHANGED: Routing-Karte zeigt jetzt individuelle Fahrer-Farben
+ *
+ * FAHRER-MARKER FARBEN v2.9.90 (2025-12-19):
+ * - CHANGED: Offline-Fahrer behalten ihre individuelle Farbe
+ * - ADDED: Offline-Fahrer haben gepunkteten Rand (stroke-dasharray)
+ * - ADDED: Offline-Fahrer sind leicht transparent (opacity 0.6)
+ * - ADDED: Offline-Fahrer haben dunkelgrauen statt weißen Rand
+ *
+ * FAHRER ONLINE-STATUS FIX v2.9.89 (2025-12-19):
+ * - FIXED: Online-Status wird jetzt korrekt von Traccar übernommen
+ * - FIXED: Alle Fahrer wurden fälschlicherweise als "Online" angezeigt
+ * - CHANGED: ajaxGetAllDriverLocations() verwendet jetzt driver_online_status aus User Meta
+ *
+ * NOTIFICATION LOGGING v2.9.88 (2025-12-19):
+ * - ADDED: logNotification() wird jetzt bei allen SMS/E-Mail Benachrichtigungen aufgerufen
+ * - FIXED: Täglicher Benachrichtigungs-Report funktioniert jetzt korrekt
+ * - ADDED: SMS "Fahrer in der Nähe" wird geloggt
+ * - ADDED: SMS "Lieferung gestartet" wird geloggt
+ * - ADDED: SMS "Zugestellt" wird geloggt
+ * - ADDED: E-Mail "Ware abgeholt" wird geloggt
+ *
+ * SMS FROM-NUMBER FIX v2.9.87 (2025-12-19):
+ * - FIXED: Twilio "Invalid From Number" error
+ * - ADDED: sendSMSViaTwilio() formatiert jetzt auch die Absendernummer mit E.164
+ * - RESULT: "656339286" wird automatisch zu "+34656339286" konvertiert
+ *
+ * SUMUP CUSTOMER INFO v2.9.86 (2025-12-18):
+ * - ADDED: SumUp übergibt jetzt Bestellnummer UND Kundenname
+ * - FORMAT: "#60631 - Max Mustermann" statt nur "Bestellung 60631"
+ * - ADDED: escapeJs() Helper-Funktion für sichere String-Übergabe
+ * - FIXED: net_payment wird übergeben (Pfand-Rückerstattungen berücksichtigt)
+ *
+ * MIDNIGHT NOTIFICATION RESET FIX v2.9.85 (2025-12-17):
+ * - FIXED: Midnight cleanup now resets ALL notification flags
+ * - ADDED: Reset of _delivery_started_notification_sent, _driver_nearby_sms_sent, _delivered_sms_sent
+ * - RESULT: Orders from previous days will receive fresh SMS/Email notifications when re-assigned
+ * - RESULT: No more "already sent" skips for multi-day orders
  *
  * METADATA SYNC FIX v2.9.74 (2025-11-19):
  * - FIXED: ajaxUpdateOrderStatus now cleans up metadata when "geladen" status is removed
@@ -238,6 +291,11 @@
  * - Converts "656339286" → "+34656339286", "0151234567" → "+49151234567"
  * - ADDED: Debug logging for phone number formatting
  *
+ * SUMUP PFAND-REFUND FIX v2.9.79 (2025-12-18):
+ * - FIXED: SumUp Button übergibt jetzt net_payment statt total
+ * - Bei Pfand-Rückerstattung wird der korrekte Restbetrag an SumUp übergeben
+ * - Beispiel: €191.50 total - €32.50 refund = €159.00 an SumUp
+ *
  * SUMUP SETTINGS FIX v2.9.32 (2025-11-14):
  * - FIXED: SumUp Affiliate Key wird jetzt korrekt gespeichert
  * - FIXED: SumUp App Identifier wird jetzt korrekt gespeichert
@@ -380,6 +438,8 @@ require_once plugin_dir_path(__FILE__) . 'includes/class-firebase-messaging-fix.
 require_once plugin_dir_path(__FILE__) . 'includes/class-nonce-manager.php';
 require_once plugin_dir_path(__FILE__) . 'includes/class-orders-manager-nonce-fix.php';
 require_once plugin_dir_path(__FILE__) . 'lib/OpenLocationCode/OpenLocationCode.php';
+require_once plugin_dir_path(__FILE__) . 'messaggio-ajax-integration.php';
+require_once plugin_dir_path(__FILE__) . 'notification-logging-addon.php';
 
 // Firebase Service Worker früh registrieren
 add_action('parse_request', function() {
@@ -612,7 +672,7 @@ if (file_exists(plugin_dir_path(__FILE__) . 'vendor/autoload.php')) {
 }
 
 // Plugin-Konstanten definieren
-define('DISPATCH_VERSION', '2.9.77');
+define('DISPATCH_VERSION', '2.9.79');
 define('DISPATCH_PLUGIN_DIR', plugin_dir_path(__FILE__));
 define('DISPATCH_PLUGIN_URL', plugin_dir_url(__FILE__));
 
@@ -634,7 +694,7 @@ class DispatchDashboard {
     use DispatchMessaging;
     use DispatchDriverCore;
     use DispatchOrderManagement;
-
+    use DispatchNotificationLog;
 
     use Dispatch_PlusCode_Addon;
 
@@ -657,10 +717,13 @@ class DispatchDashboard {
         $this->initHooks();
         // Register Plus Code addon hooks
         $this->registerPlusCodeAddonHooks();
+        // Register Notification Log hooks (daily email report)
+        $this->registerNotificationLogHooks();
         // Register roles and capabilities
         add_action('init', [$this, 'registerRolesAndCapabilities']);
-        // Register custom order status
+        // Register custom order statuses
         add_action('init', [$this, 'registerDeliveredOrderStatus']);
+        add_action('init', [$this, 'registerNachlieferungOrderStatus']);
         // Add CORS headers for web app access
         add_action('init', [$this, 'addCorsHeaders']);
         add_action('wp_loaded', [$this, 'addImageCorsHeaders']);
@@ -767,6 +830,9 @@ class DispatchDashboard {
         add_action('wp_ajax_dispatch_check_existing_drivers', [$this, 'ajaxCheckExistingDrivers']);
         add_action('wp_ajax_dispatch_create_driver_role', [$this, 'ajaxCreateDriverRole']);
 
+        // v2.9.91: Driver Color AJAX Action
+        add_action('wp_ajax_save_driver_color', [$this, 'ajaxSaveDriverColor']);
+
         // Traccar SMS Cron Job
         add_action('dispatch_check_traccar_sms', [$this, 'checkTraccarForSMS']);
         add_filter('cron_schedules', [$this, 'addCustomCronSchedules']);
@@ -780,6 +846,16 @@ class DispatchDashboard {
         add_action('wp_ajax_dispatch_save_pfand_items', [$this, 'ajaxSavePfandItems']);
         add_action('wp_ajax_get_order_pfand_data', [$this, 'ajaxGetOrderPfandData']);
         add_action('wp_ajax_save_pfand_refund', [$this, 'ajaxSavePfandRefund']);
+
+        // Nachlieferung AJAX Action
+        add_action('wp_ajax_dispatch_create_nachlieferung', [$this, 'ajaxCreateNachlieferung']);
+
+        // Nicht geliefert AJAX Action
+        add_action('wp_ajax_dispatch_nicht_geliefert', [$this, 'ajaxNichtGeliefert']);
+
+        // SumUp AJAX Actions - v2.9.86
+        add_action('wp_ajax_get_sumup_credentials', [$this, 'ajaxGetSumUpCredentials']);
+        add_action('wp_ajax_mark_sumup_payment', [$this, 'ajaxMarkSumUpPayment']);
         
         // Optimierte Suche AJAX Action
         add_action('wp_ajax_search_orders_optimized', [$this, 'ajaxSearchOrdersOptimized']);
@@ -996,12 +1072,22 @@ class DispatchDashboard {
             if (is_user_logged_in()) {
                 ?>
                 <script>
-                // Global dispatch_ajax for frontend pages - v2.6.1
+                // Global dispatch_ajax for frontend pages - v2.6.2 (with dynamic Pfand items)
                 if (typeof dispatch_ajax === 'undefined') {
                     var dispatch_ajax = {
                         ajax_url: '<?php echo admin_url('admin-ajax.php'); ?>',
                         nonce: '<?php echo wp_create_nonce('dispatch_nonce'); ?>',
-                        home_url: '<?php echo home_url(); ?>'
+                        home_url: '<?php echo home_url(); ?>',
+                        pfand_items: <?php
+                            $pfand_items_fe = get_option('dispatch_pfand_items', [
+                                ['id' => 'water', 'icon' => '🍼', 'name' => 'Wasserflasche', 'amount' => 0.25, 'active' => true],
+                                ['id' => 'beer', 'icon' => '🍺', 'name' => 'Bierflasche', 'amount' => 0.50, 'active' => true]
+                            ]);
+                            $active_items_fe = array_filter($pfand_items_fe, function($item) {
+                                return !isset($item['active']) || $item['active'] === true;
+                            });
+                            echo json_encode(array_values($active_items_fe));
+                        ?>
                     };
                 }
                 </script>
@@ -1012,6 +1098,9 @@ class DispatchDashboard {
         // Adressabweichungs-Prüfung bei Bestellungen
         add_action('woocommerce_checkout_order_processed', [$this, 'checkAddressDeviation'], 10, 3);
         add_action('woocommerce_admin_order_data_after_billing_address', [$this, 'showAddressDeviationWarning']);
+        
+        // Admin Nachlieferung Metabox
+        add_action('add_meta_boxes', [$this, 'addNachlieferungMetabox']);
         
         // AJAX handlers für Adressabweichung
         add_action('wp_ajax_dispatch_use_verified_address', [$this, 'ajaxUseVerifiedAddress']);
@@ -1068,6 +1157,10 @@ class DispatchDashboard {
         // Additional hooks to catch Order Delivery Date updates
         add_action('updated_post_meta', [$this, 'clearCacheOnDeliveryMetaUpdate'], 10, 4);
         add_action('added_post_meta', [$this, 'clearCacheOnDeliveryMetaUpdate'], 10, 4);
+
+        // Hook to recalculate distance when Plus Code is changed
+        add_action('updated_post_meta', [$this, 'recalculateDistanceOnPlusCodeChange'], 10, 4);
+        add_action('added_post_meta', [$this, 'recalculateDistanceOnPlusCodeChange'], 10, 4);
 
         // Customer notifications when delivery starts
         add_action('dispatch_delivery_started_notification', [$this, 'sendDeliveryStartedNotification'], 10, 2);
@@ -2383,14 +2476,25 @@ class DispatchDashboard {
         add_action('admin_head', function() {
             ?>
             <script>
-            // Global dispatch_ajax initialization - v2.6.1
+            // Global dispatch_ajax initialization - v2.6.2 (with dynamic Pfand items)
             if (typeof dispatch_ajax === 'undefined') {
                 var dispatch_ajax = {
                     ajax_url: '<?php echo admin_url('admin-ajax.php'); ?>',
                     nonce: '<?php echo wp_create_nonce('dispatch_nonce'); ?>',
-                    home_url: '<?php echo home_url(); ?>'
+                    home_url: '<?php echo home_url(); ?>',
+                    pfand_items: <?php
+                        $pfand_items = get_option('dispatch_pfand_items', [
+                            ['id' => 'water', 'icon' => '🍼', 'name' => 'Wasserflasche', 'amount' => 0.25, 'active' => true],
+                            ['id' => 'beer', 'icon' => '🍺', 'name' => 'Bierflasche', 'amount' => 0.50, 'active' => true]
+                        ]);
+                        // Filter nur aktive Items
+                        $active_items = array_filter($pfand_items, function($item) {
+                            return !isset($item['active']) || $item['active'] === true;
+                        });
+                        echo json_encode(array_values($active_items));
+                    ?>
                 };
-                console.log('✅ dispatch_ajax initialized globally (v2.6.1)');
+                console.log('✅ dispatch_ajax initialized globally (v2.6.2)');
             }
             </script>
             <?php
@@ -4133,7 +4237,7 @@ class DispatchDashboard {
                 $max_num_pages = 1; // Reset pagination since we filtered manually
             }
             
-            // Manual filtering for incomplete/unvollstandige orders (past dates, not completed)
+            // Manual filtering for incomplete/unvollstandige orders (past dates OR missing date)
             if (($filter === 'unvollstandige' || $filter === 'incomplete') && is_array($orders)) {
                 $filtered_orders = [];
                 $today = new DateTime('today', wp_timezone());
@@ -4149,19 +4253,29 @@ class DispatchDashboard {
                         $delivery_date = $order->get_meta('_delivery_date');
                     }
 
-                    // Include only if delivery date is PAST (before today) and order not completed
-                    if (!empty($delivery_date)) {
+                    $is_incomplete = false;
+
+                    // Include if: NO delivery date OR delivery date is PAST (before today)
+                    if (empty($delivery_date)) {
+                        // Kein Lieferdatum = Unvollständig
+                        $is_incomplete = true;
+                    } else {
+                        // Mit Lieferdatum: nur wenn in der Vergangenheit
                         $delivery_date_parsed = $this->parseDeliveryDate($delivery_date);
                         if ($delivery_date_parsed && $delivery_date_parsed->format('Y-m-d') < $today_ymd) {
-                            $filtered_orders[] = $order;
+                            $is_incomplete = true;
+                        }
+                    }
 
-                            // WICHTIG: Auto-Unassign - Fahrer entfernen wenn Auftrag unvollständig wird
-                            $assigned_driver = $order->get_meta('_assigned_driver');
-                            if (!empty($assigned_driver)) {
-                                $order->delete_meta_data('_assigned_driver');
-                                $order->save();
-                                error_log("Auto-Unassign: Removed driver from incomplete order #{$order->get_id()}");
-                            }
+                    if ($is_incomplete) {
+                        $filtered_orders[] = $order;
+
+                        // WICHTIG: Auto-Unassign - Fahrer entfernen wenn Auftrag unvollständig wird
+                        $assigned_driver = $order->get_meta('_assigned_driver');
+                        if (!empty($assigned_driver)) {
+                            $order->delete_meta_data('_assigned_driver');
+                            $order->save();
+                            error_log("Auto-Unassign: Removed driver from incomplete order #{$order->get_id()}");
                         }
                     }
                 }
@@ -4249,7 +4363,8 @@ class DispatchDashboard {
                     // Get additional metadata for completed orders
                     $loaded_timestamp = $order->get_meta('_order_ready_timestamp');
                     $loaded_time = $loaded_timestamp ? date('d.m.Y H:i', strtotime($loaded_timestamp)) : '';
-                    $delivered_time = $order->get_meta('_delivered_at');
+                    // FIX v2.9.95: Use correct meta key _delivery_completed_date instead of _delivered_at
+                    $delivered_time = $order->get_meta('_delivery_completed_date');
                     // Try new meta keys first, fallback to legacy keys
                     $rating_order = $order->get_meta('_rating_stars') ?: $order->get_meta('_rating_order');
                     $rating_driver = $order->get_meta('_driver_rating_stars') ?: $order->get_meta('_rating_driver');
@@ -4729,26 +4844,28 @@ class DispatchDashboard {
                     $delivery_date = $order->get_meta('_delivery_date');
                 }
 
-                // Include if: delivery date matches today OR no delivery date set
-                if (empty($delivery_date) ||
-                    $delivery_date === $today_ymd ||
-                    $delivery_date === $today_dmy ||
-                    $delivery_date === $today_en ||
-                    $delivery_date === $today_de) {
-                    $filtered_orders[] = $order;
-                } else {
-                    // Parse das Datum falls es ein anderes Format hat
-                    $parsed_date = $this->parseDeliveryDate($delivery_date);
-                    if ($parsed_date && $parsed_date->format('Y-m-d') === $today_ymd) {
+                // Include ONLY if delivery date matches today (no date = incomplete, not current!)
+                if (!empty($delivery_date)) {
+                    if ($delivery_date === $today_ymd ||
+                        $delivery_date === $today_dmy ||
+                        $delivery_date === $today_en ||
+                        $delivery_date === $today_de) {
                         $filtered_orders[] = $order;
+                    } else {
+                        // Parse das Datum falls es ein anderes Format hat
+                        $parsed_date = $this->parseDeliveryDate($delivery_date);
+                        if ($parsed_date && $parsed_date->format('Y-m-d') === $today_ymd) {
+                            $filtered_orders[] = $order;
+                        }
                     }
                 }
+                // Orders without delivery date are NOT current - they go to incomplete
             }
 
             $orders = $filtered_orders;
         }
 
-        // Post-process filter für incomplete orders (vergangene, nicht abgeschlossene)
+        // Post-process filter für incomplete orders (vergangene ODER ohne Lieferdatum)
         if ($filter === 'incomplete') {
             $filtered_orders = [];
             $today = new DateTime('today', wp_timezone());
@@ -4764,8 +4881,12 @@ class DispatchDashboard {
                     $delivery_date = $order->get_meta('_delivery_date');
                 }
 
-                // Include only if delivery date is PAST (before today) and not completed
-                if (!empty($delivery_date)) {
+                // Include if: NO delivery date OR delivery date is PAST (before today)
+                if (empty($delivery_date)) {
+                    // Kein Lieferdatum = Unvollständig
+                    $filtered_orders[] = $order;
+                } else {
+                    // Mit Lieferdatum: nur wenn in der Vergangenheit
                     $delivery_date_parsed = $this->parseDeliveryDate($delivery_date);
                     if ($delivery_date_parsed && $delivery_date_parsed->format('Y-m-d') < $today_ymd) {
                         $filtered_orders[] = $order;
@@ -4888,7 +5009,8 @@ class DispatchDashboard {
             }
 
             if ($ready_time && $delivered_timestamp) {
-                $ready_timestamp = strtotime($ready_time);
+                // Fixed: Handle both Unix timestamp and MySQL date string formats
+                $ready_timestamp = is_numeric($ready_time) ? intval($ready_time) : strtotime($ready_time);
                 $duration = ($delivered_timestamp - $ready_timestamp) / 60; // in Minuten
 
                 if ($duration > 0 && $duration < 300) { // Nur sinnvolle Werte (< 5 Stunden)
@@ -4925,7 +5047,8 @@ class DispatchDashboard {
             }
 
             if ($ready_time && $delivered_timestamp) {
-                $ready_timestamp = strtotime($ready_time);
+                // Fixed: Handle both Unix timestamp and MySQL date string formats
+                $ready_timestamp = is_numeric($ready_time) ? intval($ready_time) : strtotime($ready_time);
                 $duration = ($delivered_timestamp - $ready_timestamp) / 60;
 
                 if ($duration > 0 && $duration < 300) {
@@ -5405,15 +5528,17 @@ class DispatchDashboard {
 
         $current_order_id = intval($_POST['current_order_id'] ?? 0);
         $refund_items = $_POST['refund_items'] ?? [];
+        $manual_pfand_items = $_POST['manual_pfand_items'] ?? [];
         $missing_bottles = $_POST['missing_bottles'] ?? [];
         $reason = sanitize_text_field($_POST['reason'] ?? '');
         $refund_mode = sanitize_text_field($_POST['refund_mode'] ?? 'with-order');
 
-        error_log('ajaxRefundPfand: Processing order ' . $current_order_id . ' with ' . count($refund_items) . ' items');
+        error_log('ajaxRefundPfand: Processing order ' . $current_order_id . ' with ' . count($refund_items) . ' history items and ' . count($manual_pfand_items) . ' manual items');
 
-        if (empty($refund_items)) {
-            error_log('ajaxRefundPfand: No refund items');
-            wp_send_json_error('Keine Pfand-Artikel ausgewählt');
+        // Validierung: Entweder Historie-Items ODER manuelle Items müssen vorhanden sein
+        if (empty($refund_items) && empty($manual_pfand_items)) {
+            error_log('ajaxRefundPfand: No refund items (neither history nor manual)');
+            wp_send_json_error('Keine Pfand-Artikel ausgewählt (weder aus Historie noch manuell)');
             return;
         }
 
@@ -5434,16 +5559,34 @@ class DispatchDashboard {
         // Berechne Gesamtgutschrift
         $total_credit = 0;
         $total_deduction = 0;
-        
+
+        // Credits aus Historie-Items
         foreach ($refund_items as $item) {
             $total_credit += floatval($item['amount']);
         }
+
+        // Credits aus manuellen Pfand-Items
+        foreach ($manual_pfand_items as $item) {
+            $total_credit += floatval($item['amount']);
+        }
         
-        // Berechne Abzug für fehlende Flaschen
+        // Berechne Abzug für fehlende Flaschen - dynamisch aus Einstellungen (v2.6.2)
+        $pfand_items_config = get_option('dispatch_pfand_items', [
+            ['id' => 'water', 'icon' => '🍼', 'name' => 'Wasserflasche', 'amount' => 0.25, 'active' => true],
+            ['id' => 'beer', 'icon' => '🍺', 'name' => 'Bierflasche', 'amount' => 0.50, 'active' => true]
+        ]);
+        // Erstelle Lookup-Array für schnellen Zugriff
+        $pfand_prices = [];
+        foreach ($pfand_items_config as $item) {
+            if (!isset($item['active']) || $item['active'] === true) {
+                $pfand_prices[$item['name']] = floatval($item['amount']);
+                $pfand_prices[$item['id']] = floatval($item['amount']);
+            }
+        }
         foreach ($missing_bottles as $bottle_type => $quantity) {
             if ($quantity > 0) {
-                // Hier könnten die Pfand-Preise aus den Einstellungen geholt werden
-                $bottle_price = ($bottle_type === 'Wasserflasche') ? 0.25 : 0.50;
+                // Dynamischer Preis aus Konfiguration oder Fallback
+                $bottle_price = $pfand_prices[$bottle_type] ?? ($bottle_type === 'Wasserflasche' ? 0.25 : 0.50);
                 $total_deduction += $quantity * $bottle_price;
             }
         }
@@ -5471,7 +5614,7 @@ class DispatchDashboard {
                 ));
 
                 // Mark the order as having had pfand refunded
-                $current_order->update_meta_data('_pfand_refunded_amount', $net_credit);
+                $current_order->update_meta_data('_pfand_refund_amount', $net_credit);  // Fixed: was _pfand_refunded_amount
                 $current_order->update_meta_data('_pfand_refund_mode', 'pfand-only');
 
                 // For pfand-only mode, the total stays the same
@@ -5547,6 +5690,16 @@ class DispatchDashboard {
             }
 
             $current_order->add_order_note($note);
+
+            // v2.9.95: Get driver name early
+            $current_user = wp_get_current_user();
+            $driver_name = $current_user->display_name ?: $current_user->user_login;
+
+            // v2.9.95: Pfand-Items für Statistik speichern
+            $current_order->update_meta_data('_pfand_refund_items', $refund_items);
+            $current_order->update_meta_data('_pfand_refund_amount', $net_credit);
+            $current_order->update_meta_data('_pfand_refund_driver', $driver_name);
+            $current_order->save();
 
             // DATABASE FIX: Batch process pfand items to reduce DB writes and prevent race conditions
             // Collect all unique order IDs first
@@ -7367,6 +7520,7 @@ class DispatchDashboard {
                                 Status
                                 <span class="sorting-indicator" aria-hidden="true"></span>
                             </th>
+                            <th>Farbe</th>
                             <th>Traccar QR</th>
                             <th></th>
                         </tr>
@@ -7384,6 +7538,24 @@ class DispatchDashboard {
                                 $traccar_device_id = get_user_meta($driver->id, 'traccar_device_id', true);
                             }
                             $traccar_url = get_option('dispatch_traccar_api_url', 'http://91.98.17.58:8082');
+
+                            // v2.9.92: Get custom driver color - auto-save default if not set
+                            $driver_color = get_user_meta($driver->id, 'dispatch_driver_color', true);
+                            if (empty($driver_color)) {
+                                // Use same hash algorithm as JavaScript getDriverColor() for consistency
+                                $default_colors = ['#3B82F6', '#EF4444', '#9333EA', '#F59E0B', '#8B5CF6', '#EC4899', '#14B8A6', '#F97316', '#6366F1', '#0EA5E9'];
+                                $str = strtolower(trim($driver->name));
+                                $hash = 0;
+                                for ($i = 0; $i < strlen($str); $i++) {
+                                    $hash = (($hash << 5) + $hash) + ord($str[$i]);
+                                    $hash = $hash & 0xFFFFFFFF; // 32bit integer
+                                    if ($hash > 0x7FFFFFFF) $hash -= 0x100000000; // Convert to signed
+                                }
+                                $colorIndex = (($hash % count($default_colors)) + count($default_colors)) % count($default_colors);
+                                $driver_color = $default_colors[$colorIndex];
+                                // Auto-save the default color so it's available on the routing page
+                                update_user_meta($driver->id, 'dispatch_driver_color', $driver_color);
+                            }
                         ?>
                         <tr data-driver-id="<?php echo $driver->id; ?>">
                             <td>
@@ -7410,6 +7582,14 @@ class DispatchDashboard {
                                 <span class="driver-status <?php echo $driver->status; ?>">
                                     <?php echo $status_text; ?>
                                 </span>
+                            </td>
+                            <td style="text-align: center;">
+                                <input type="color"
+                                       class="driver-color-picker"
+                                       data-driver-id="<?php echo $driver->id; ?>"
+                                       value="<?php echo esc_attr($driver_color); ?>"
+                                       title="Farbe für <?php echo esc_attr($driver->name); ?>"
+                                       style="width: 40px; height: 30px; border: none; cursor: pointer; border-radius: 4px;">
                             </td>
                             <td style="text-align: center;">
                                 <a href="<?php echo esc_url(home_url('/traccar-qr-generator-admin.php?driver_id=' . $driver->id)); ?>"
@@ -7473,6 +7653,39 @@ class DispatchDashboard {
         document.addEventListener('DOMContentLoaded', function() {
             updateAllDriverStatus();
             setInterval(updateAllDriverStatus, 10000);
+        });
+
+        // v2.9.91: Driver Color Picker - Save color when changed
+        document.addEventListener('DOMContentLoaded', function() {
+            document.querySelectorAll('.driver-color-picker').forEach(picker => {
+                picker.addEventListener('change', function() {
+                    const driverId = this.dataset.driverId;
+                    const color = this.value;
+
+                    // Visual feedback
+                    this.style.boxShadow = '0 0 0 2px #10b981';
+
+                    fetch('<?php echo admin_url("admin-ajax.php"); ?>', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: 'action=save_driver_color&driver_id=' + driverId + '&color=' + encodeURIComponent(color) + '&nonce=<?php echo wp_create_nonce("dispatch_nonce"); ?>'
+                    })
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            console.log('✅ Farbe gespeichert für Fahrer #' + driverId + ': ' + color);
+                            setTimeout(() => { this.style.boxShadow = ''; }, 1000);
+                        } else {
+                            console.error('❌ Fehler beim Speichern der Farbe:', data.data);
+                            this.style.boxShadow = '0 0 0 2px #ef4444';
+                        }
+                    })
+                    .catch(error => {
+                        console.error('❌ Fehler:', error);
+                        this.style.boxShadow = '0 0 0 2px #ef4444';
+                    });
+                });
+            });
         });
 
         // Driver Menu (three dots)
@@ -9165,30 +9378,48 @@ class DispatchDashboard {
         // Load colors from settings, ensure we have enough colors for good distribution
         let driverColorsFromSettings = <?php echo json_encode(get_option('dispatch_driver_colors', [])); ?>;
         const defaultDriverColors = ['#3B82F6', '#EF4444', '#9333EA', '#F59E0B', '#8B5CF6', '#EC4899', '#14B8A6', '#F97316', '#6366F1', '#0EA5E9'];
-        
+
         // Use settings colors if available and sufficient, otherwise use defaults
         const driverColors = (driverColorsFromSettings && driverColorsFromSettings.length >= 5) ? driverColorsFromSettings : defaultDriverColors;
-        
+
+        // v2.9.91: Load custom driver colors from user meta
+        const customDriverColors = <?php
+            $drivers = get_users(['role' => 'lieferfahrer']);
+            $custom_colors = [];
+            foreach ($drivers as $driver) {
+                $color = get_user_meta($driver->ID, 'dispatch_driver_color', true);
+                if (!empty($color)) {
+                    $custom_colors[$driver->display_name] = $color;
+                }
+            }
+            echo json_encode($custom_colors);
+        ?>;
+
         function getDriverColor(driverName) {
             if (!driverName || driverName.trim() === '') {
                 return '#10B981'; // Grün für unzugewiesene Aufträge
             }
-            
-            // Verbesserte Hash-Funktion für bessere Verteilung
+
+            // v2.9.91: Check for custom color first
+            const normalizedName = driverName.replace(' (Test)', '').trim();
+            if (customDriverColors && customDriverColors[normalizedName]) {
+                return customDriverColors[normalizedName];
+            }
+
+            // Fallback: Hash-basierte Farbzuweisung
             let hash = 0;
-            const str = driverName.toLowerCase().trim(); // Normalisiere den Namen
-            
+            const str = driverName.toLowerCase().trim();
+
             // Verwende djb2 Hash-Algorithmus für bessere Verteilung
             for (let i = 0; i < str.length; i++) {
                 hash = ((hash << 5) + hash) + str.charCodeAt(i);
                 hash = hash & hash; // Convert to 32bit integer
             }
-            
+
             // Verwende positive Modulo für konsistente Ergebnisse
             const colorIndex = ((hash % driverColors.length) + driverColors.length) % driverColors.length;
             const color = driverColors[colorIndex];
-            
-            
+
             return color;
         }
 
@@ -9724,12 +9955,19 @@ class DispatchDashboard {
                         initials = initials.toUpperCase();
                         
                         // Create custom marker icon with initials - use driver's assigned color
-                        const markerColor = driver.online_status === 'online' ? getDriverColor(driver.driver_name) : '#6B7280'; // Driver's color for online, gray for offline
+                        // v2.9.90: Offline drivers keep their color but with visual indicator
+                        const markerColor = getDriverColor(driver.driver_name); // Always use driver's individual color
+                        const isOnline = driver.online_status === 'online';
+                        const opacity = isOnline ? '1' : '0.6'; // Offline drivers are slightly transparent
+                        const strokeDash = isOnline ? '' : 'stroke-dasharray="4 2"'; // Offline drivers have dashed border
+                        const strokeColor = isOnline ? 'white' : '#374151'; // Offline drivers have dark gray border
+                        const strokeWidth = isOnline ? '3' : '2';
+
                         const markerIcon = {
                             url: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(`
                                 <svg width="40" height="40" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg">
-                                    <circle cx="20" cy="20" r="18" fill="${markerColor}" stroke="white" stroke-width="3"/>
-                                    <text x="20" y="26" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="white">${initials}</text>
+                                    <circle cx="20" cy="20" r="18" fill="${markerColor}" fill-opacity="${opacity}" stroke="${strokeColor}" stroke-width="${strokeWidth}" ${strokeDash}/>
+                                    <text x="20" y="26" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-weight="bold" fill="${isOnline ? 'white' : 'rgba(255,255,255,0.8)'}">${initials}</text>
                                 </svg>
                             `),
                             scaledSize: new google.maps.Size(40, 40),
@@ -10912,7 +11150,44 @@ class DispatchDashboard {
             wp_send_json_error(['message' => 'Fehler beim Erstellen der Rolle']);
         }
     }
-    
+
+    /**
+     * AJAX: Fahrer-Farbe speichern (v2.9.91)
+     */
+    public function ajaxSaveDriverColor(): void {
+        // Verify nonce
+        if (!isset($_POST['nonce']) || !wp_verify_nonce($_POST['nonce'], 'dispatch_nonce')) {
+            wp_send_json_error('Sicherheitsüberprüfung fehlgeschlagen');
+            return;
+        }
+
+        // Check permissions
+        if (!current_user_can('manage_woocommerce')) {
+            wp_send_json_error('Keine Berechtigung');
+            return;
+        }
+
+        $driver_id = isset($_POST['driver_id']) ? intval($_POST['driver_id']) : 0;
+        $color = isset($_POST['color']) ? sanitize_hex_color($_POST['color']) : '';
+
+        if (!$driver_id || !$color) {
+            wp_send_json_error('Ungültige Parameter');
+            return;
+        }
+
+        // Verify the user exists and is a driver
+        $user = get_user_by('id', $driver_id);
+        if (!$user) {
+            wp_send_json_error('Fahrer nicht gefunden');
+            return;
+        }
+
+        // Save the color
+        update_user_meta($driver_id, 'dispatch_driver_color', $color);
+
+        wp_send_json_success(['message' => 'Farbe gespeichert', 'driver_id' => $driver_id, 'color' => $color]);
+    }
+
     /**
      * AJAX: Lieferfahrer-Rolle neu erstellen (für Fehlerbehebung)
      */
@@ -12805,6 +13080,18 @@ class DispatchDashboard {
             }
         }
 
+        // FIX v2.9.95: Set _delivery_completed_date when order is marked as delivered or completed
+        // This ensures the "Tatsächliche Lieferzeit" column shows the correct time
+        if (in_array($to_status, ['delivered', 'completed'])) {
+            $existing_completed_date = $order->get_meta('_delivery_completed_date');
+            if (empty($existing_completed_date)) {
+                $order->update_meta_data('_delivery_completed_date', current_time('mysql'));
+                $order->update_meta_data('_delivery_completed_by', get_current_user_id());
+                $order->save();
+                error_log("Dispatch: Set _delivery_completed_date for order #{$order_id} on status change to {$to_status}");
+            }
+        }
+
         $driver_id = $order->get_meta('_assigned_driver');
 
         // Only send notifications for orders with assigned drivers
@@ -12824,6 +13111,7 @@ class DispatchDashboard {
                 $this->sendDispatchNotification($order, 'delivery_started');
                 break;
             case 'completed':
+            case 'delivered':
                 // Order has been delivered
                 $this->sendDispatchNotification($order, 'delivered');
                 break;
@@ -13932,7 +14220,19 @@ class DispatchDashboard {
                   "Ihre SMS-Benachrichtigungen sind korrekt konfiguriert! ✅";
         
         $result = $this->sendSMSViaTwilio($account_sid, $auth_token, $from_number, $phone_number, $message);
-        
+
+        // Log notification for daily report
+        $this->logNotification(
+            'sms',
+            'test_sms',
+            0, // no order_id for test
+            $phone_number,
+            'Test User',
+            $result['success'],
+            $message,
+            $result['error'] ?? ''
+        );
+
         if ($result['success']) {
             wp_send_json_success('SMS erfolgreich gesendet');
         } else {
@@ -14022,7 +14322,19 @@ class DispatchDashboard {
                 ];
                 
                 $email_sent = wp_mail($customer_email, $subject, $message, $headers);
-                
+
+                // Log notification for daily report
+                $this->logNotification(
+                    'email',
+                    'order_picked_up',
+                    $order_id,
+                    $customer_email,
+                    $customer_name,
+                    $email_sent,
+                    $subject,
+                    $email_sent ? '' : 'wp_mail returned false'
+                );
+
                 if ($email_sent) {
                     $order->add_order_note('Kunden-E-Mail "Ware ist auf dem Weg" versendet');
                     $order->save();
@@ -15374,6 +15686,7 @@ class DispatchDashboard {
     
     /**
      * AJAX: Get SumUp Credentials for current driver
+     * v2.9.86: Fallback auf globalen Key wenn kein User-spezifischer Key vorhanden
      */
     public function ajaxGetSumUpCredentials(): void {
         Dispatch_Security::verify_driver_access(true);
@@ -15385,7 +15698,13 @@ class DispatchDashboard {
             return;
         }
 
+        // Erst User-spezifischen Key prüfen
         $affiliate_key = get_user_meta($user_id, 'sumup_affiliate_key', true);
+
+        // Fallback auf globalen Key aus Plugin-Einstellungen
+        if (empty($affiliate_key)) {
+            $affiliate_key = get_option('dispatch_sumup_affiliate_key', '');
+        }
 
         if (empty($affiliate_key)) {
             wp_send_json_error(['message' => 'SumUp Affiliate Key nicht konfiguriert']);
@@ -15699,9 +16018,10 @@ class DispatchDashboard {
         $minutes_per_stop = intval(get_option('dispatch_average_stop_duration', '10'));
         $travel_time_minutes = 0;
 
-        // Get real driving time from OSRM
+        // Get real driving time from OSRM (use configured server with public fallback)
         if (!empty($customer_lat) && !empty($customer_lng)) {
-            $osrm_url = "https://router.project-osrm.org/route/v1/driving/{$driver_lng},{$driver_lat};{$customer_lng},{$customer_lat}?overview=false";
+            $osrm_base = rtrim(get_option('dispatch_osrm_api_url', 'https://router.project-osrm.org'), '/');
+            $osrm_url = "{$osrm_base}/route/v1/driving/{$driver_lng},{$driver_lat};{$customer_lng},{$customer_lat}?overview=false";
 
             $response = wp_remote_get($osrm_url, ['timeout' => 5]);
 
@@ -16063,8 +16383,9 @@ class DispatchDashboard {
      * @return int ETA in minutes
      */
     private function calculateRealisticETA($from_lat, $from_lng, $to_lat, $to_lng): int {
-        // Try OSRM first for realistic driving time
-        $osrm_url = "https://router.project-osrm.org/route/v1/driving/{$from_lng},{$from_lat};{$to_lng},{$to_lat}?overview=false";
+        // Try OSRM first for realistic driving time (use configured server with public fallback)
+        $osrm_base = rtrim(get_option('dispatch_osrm_api_url', 'https://router.project-osrm.org'), '/');
+        $osrm_url = "{$osrm_base}/route/v1/driving/{$from_lng},{$from_lat};{$to_lng},{$to_lat}?overview=false";
 
         $response = wp_remote_get($osrm_url, ['timeout' => 5]);
 
@@ -16177,6 +16498,19 @@ class DispatchDashboard {
         // Send SMS
         $result = $this->sendSMSViaTwilio($account_sid, $auth_token, $from_number, $formatted_phone, $message);
 
+        // Log notification for daily report
+        $customer_name = $order->get_billing_first_name() . ' ' . $order->get_billing_last_name();
+        $this->logNotification(
+            'sms',
+            'driver_nearby',
+            $order->get_id(),
+            $formatted_phone,
+            $customer_name,
+            $result['success'],
+            $message,
+            $result['error'] ?? ''
+        );
+
         if ($result['success']) {
             error_log("DRIVER NEARBY SMS: Sent to $formatted_phone for order #{$order->get_id()} (ETA: $eta_minutes min)");
             $order->add_order_note("📍 SMS 'Fahrer in der Nähe' gesendet (ETA: $eta_minutes Min.)");
@@ -16196,6 +16530,12 @@ class DispatchDashboard {
      * @return array ['success' => bool, 'error' => string|null, 'sid' => string|null]
      */
     private function sendSMSViaTwilio($account_sid, $auth_token, $from_number, $to_number, $message): array {
+        // v2.9.80: Also format the FROM number to E.164 (fixes "Invalid From Number" error)
+        $formatted_from = $this->formatPhoneNumberE164($from_number);
+        if ($formatted_from) {
+            $from_number = $formatted_from;
+        }
+
         $url = "https://api.twilio.com/2010-04-01/Accounts/{$account_sid}/Messages.json";
 
         $response = wp_remote_post($url, [
@@ -16412,6 +16752,19 @@ class DispatchDashboard {
         // Send SMS
         $result = $this->sendSMSViaTwilio($account_sid, $auth_token, $from_number, $formatted_phone, $message);
 
+        // Log notification for daily report
+        $customer_name = $order->get_billing_first_name() . ' ' . $order->get_billing_last_name();
+        $this->logNotification(
+            'sms',
+            'delivery_started',
+            $order->get_id(),
+            $formatted_phone,
+            $customer_name,
+            $result['success'],
+            $message,
+            $result['error'] ?? ''
+        );
+
         if ($result['success']) {
             error_log("DELIVERY STARTED SMS: Sent to $formatted_phone for order #{$order->get_id()}");
             $order->add_order_note("🚚 SMS 'Fahrer unterwegs' gesendet an $formatted_phone");
@@ -16496,6 +16849,19 @@ class DispatchDashboard {
 
         // Send SMS
         $result = $this->sendSMSViaTwilio($account_sid, $auth_token, $from_number, $formatted_phone, $message);
+
+        // Log notification for daily report
+        $customer_name = $order->get_billing_first_name() . ' ' . $order->get_billing_last_name();
+        $this->logNotification(
+            'sms',
+            'delivered',
+            $order_id,
+            $formatted_phone,
+            $customer_name,
+            $result['success'],
+            $message,
+            $result['error'] ?? ''
+        );
 
         if ($result['success']) {
             error_log("DELIVERED SMS: Sent to $formatted_phone for order #$order_id");
@@ -17297,11 +17663,10 @@ class DispatchDashboard {
                             </div>
                             
                             <?php
-                            // Aggregate all products from ALL orders (not just last date!)
-                            // Fix: Use $orders instead of $reversed_orders to include all dates
+                            // Aggregate all products from all orders (using reversed order for packing)
                             $aggregated_products = [];
 
-                            foreach ($orders as $order) {
+                            foreach ($reversed_orders as $order) {
                                 foreach ($order->get_items() as $item) {
                                     $product = $item->get_product();
                                     if (!$product) continue;
@@ -17411,7 +17776,7 @@ class DispatchDashboard {
                                     if ($current_location !== $data['location']):
                                         $current_location = $data['location'];
                                 ?>
-                                <div class="location-separator print-hide" style="background: #e5e7eb; padding: 12px 16px; border-radius: 6px; margin: 10px 0 5px 0;">
+                                <div class="location-separator" style="background: #e5e7eb; padding: 12px 16px; border-radius: 6px; margin: 10px 0 5px 0;">
                                     <strong style="color: #374151; display: flex; align-items: center; gap: 8px;">
                                         📍 Standort/Regal: <?php echo esc_html($current_location); ?>
                                     </strong>
@@ -17441,7 +17806,7 @@ class DispatchDashboard {
                                             <?php endif; ?>
                                         </div>
                                         <?php endif; ?>
-                                        <div class="loading-item-details print-hide" style="color: #6b7280; font-size: 14px; margin-bottom: 8px;">
+                                        <div style="color: #6b7280; font-size: 14px; margin-bottom: 8px;">
                                             <?php if ($data['sku']): ?>
                                                 <span style="background: #f3f4f6; padding: 2px 6px; border-radius: 3px; margin-right: 8px;">
                                                     SKU: <?php echo esc_html($data['sku']); ?>
@@ -17451,7 +17816,7 @@ class DispatchDashboard {
                                                 📍 <?php echo esc_html($data['location']); ?>
                                             </span>
                                         </div>
-                                        <div class="loading-item-orders print-hide" style="color: #4b5563; font-size: 13px;">
+                                        <div style="color: #4b5563; font-size: 13px;">
                                             <strong>Enthalten in Bestellungen:</strong>
                                             <?php echo implode(', ', array_unique($data['orders'])); ?>
                                         </div>
@@ -17488,49 +17853,9 @@ class DispatchDashboard {
         
         <style>
         @media print {
-            /* WordPress Admin Sidebar komplett ausblenden */
-            #adminmenuwrap, #adminmenu, #wpadminbar, #adminmenumain,
-            #wpfooter, .notice, .update-nag, #screen-meta,
-            #adminmenuback, .wp-responsive-open #wpcontent {
-                display: none !important;
-            }
-
-            /* Hauptinhalt auf volle Breite */
-            #wpcontent, #wpbody, #wpbody-content, .wrap {
-                margin-left: 0 !important;
-                padding-left: 0 !important;
-                width: 100% !important;
-            }
-
-            body.wp-admin {
-                margin-left: 0 !important;
-            }
-
-            /* Plugin-spezifische Elemente ausblenden */
-            .top-navigation, .dispatch-header, .btn, .header-right {
-                display: none !important;
-            }
-
-            /* Seitenumbruch pro Fahrer */
-            .driver-packlist-section {
-                page-break-after: always;
-            }
-
-            /* Checkbox-Styling für Druck */
-            .check-box, .check-box-large {
-                background: white !important;
-                -webkit-print-color-adjust: exact;
-                print-color-adjust: exact;
-            }
-
-            /* LADELISTE KOMPLETT: Nur essenzielle Infos anzeigen */
-            .loading-list-header p,                /* "Alle Produkte aus X Bestellungen" Text */
-            .loading-summary,                       /* Gesamtsumme unten */
-            .location-separator,                    /* Standort/Regal Trenner */
-            .print-hide                             /* Alle Elemente mit print-hide Klasse */
-            {
-                display: none !important;
-            }
+            .top-navigation, .dispatch-header, .btn { display: none !important; }
+            .driver-packlist-section { page-break-after: always; }
+            .check-box { background: white !important; }
         }
         
         .driver-packlist-section:hover {
@@ -17624,10 +17949,8 @@ class DispatchDashboard {
                 printWindow.document.write('<style>');
                 printWindow.document.write('body { font-family: Arial, sans-serif; margin: 20px; }');
                 printWindow.document.write('.check-box-large { display: inline-block; width: 20px; height: 20px; border: 2px solid #333; margin-right: 10px; }');
+                printWindow.document.write('.location-separator { background: #f0f0f0; padding: 10px; margin: 15px 0 5px 0; font-weight: bold; }');
                 printWindow.document.write('img { max-width: 50px; max-height: 50px; }');
-                // Vereinfachte Druckansicht: Nur Produkte + Menge
-                printWindow.document.write('.print-hide, .location-separator, .loading-summary, .loading-list-header p { display: none !important; }');
-                printWindow.document.write('.loading-item { margin: 8px 0; padding: 10px; border: 1px solid #ccc; display: flex; align-items: center; gap: 10px; }');
                 printWindow.document.write('</style>');
                 printWindow.document.write('</head><body>');
                 printWindow.document.write(section.innerHTML);
@@ -18231,28 +18554,28 @@ class DispatchDashboard {
 
                     <div class="widget-card">
                         <div class="widget-header" style="background: linear-gradient(135deg, #3B82F6 0%, #1D4ED8 100%); color: white; padding: 15px; border-radius: 8px 8px 0 0;">
-                            <h3 style="margin: 0; font-size: 16px;"><span class="dashicons dashicons-groups"></span> Aktive Kunden</h3>
+                            <h3 style="margin: 0; font-size: 16px;"><span class="dashicons dashicons-yes-alt"></span> Erstattet (Gesamt)</h3>
                         </div>
                         <div class="widget-content" style="padding: 20px; text-align: center; background: white; border-radius: 0 0 8px 8px; border: 1px solid #e5e7eb;">
                             <div class="metric-value" style="font-size: 2.2em; font-weight: bold; color: #3B82F6;">
-                                <?php echo $pfandSummary['active_customers']; ?>
+                                €<?php echo number_format($pfandSummary['total_refunded'], 2); ?>
                             </div>
                             <div class="metric-label" style="color: #6B7280; margin-top: 5px;">
-                                Kunden mit offenen Pfandbeträgen
+                                Von Fahrern zurückerstattet
                             </div>
                         </div>
                     </div>
 
                     <div class="widget-card">
                         <div class="widget-header" style="background: linear-gradient(135deg, #F59E0B 0%, #D97706 100%); color: white; padding: 15px; border-radius: 8px 8px 0 0;">
-                            <h3 style="margin: 0; font-size: 16px;"><span class="dashicons dashicons-warning"></span> Kritische Fälle</h3>
+                            <h3 style="margin: 0; font-size: 16px;"><span class="dashicons dashicons-clock"></span> Beim Kunden</h3>
                         </div>
                         <div class="widget-content" style="padding: 20px; text-align: center; background: white; border-radius: 0 0 8px 8px; border: 1px solid #e5e7eb;">
                             <div class="metric-value" style="font-size: 2.2em; font-weight: bold; color: #F59E0B;">
-                                <?php echo $pfandSummary['critical_count']; ?>
+                                <?php echo $pfandSummary['pending_refund_count']; ?>
                             </div>
                             <div class="metric-label" style="color: #6B7280; margin-top: 5px;">
-                                Kunden mit Pfand > €20 oder > 30 Tage
+                                Bestellungen mit ausstehendem Pfand
                             </div>
                         </div>
                     </div>
@@ -20083,6 +20406,11 @@ class DispatchDashboard {
             'twilio_account_sid' => get_option('dispatch_twilio_account_sid', ''),
             'twilio_auth_token' => get_option('dispatch_twilio_auth_token', ''),
             'twilio_phone_number' => get_option('dispatch_twilio_phone_number', ''),
+            'sms_provider' => get_option('dispatch_sms_provider', 'twilio'),
+            'messaggio_project_login' => get_option('dispatch_messaggio_project_login', ''),
+            'messaggio_secret_key' => get_option('dispatch_messaggio_secret_key', ''),
+            'messaggio_sender_code' => get_option('dispatch_messaggio_sender_code', ''),
+            'messaggio_api_endpoint' => get_option('dispatch_messaggio_api_endpoint', 'https://api.messaggio.com/v1/sms/send'),
             'sms_notification_timing' => get_option('dispatch_sms_notification_timing', '30'),
             // SMS Text Templates
             'sms_delivery_started_template' => get_option('dispatch_sms_delivery_started_template', "🚚 {driver_name} ist unterwegs zu Ihnen!\n\nBestellung #{order_number}\nVoraussichtliche Lieferzeit: {delivery_time}\n\nTracking: {tracking_url}"),
@@ -20461,6 +20789,11 @@ class DispatchDashboard {
         update_option('dispatch_twilio_account_sid', sanitize_text_field($_POST['twilio_account_sid'] ?? ''));
         update_option('dispatch_twilio_auth_token', sanitize_text_field($_POST['twilio_auth_token'] ?? ''));
         update_option('dispatch_twilio_phone_number', sanitize_text_field($_POST['twilio_phone_number'] ?? ''));
+        update_option('dispatch_sms_provider', sanitize_text_field($_POST['sms_provider'] ?? 'twilio'));
+        update_option('dispatch_messaggio_project_login', sanitize_text_field($_POST['messaggio_project_login'] ?? ''));
+        update_option('dispatch_messaggio_secret_key', sanitize_text_field($_POST['messaggio_secret_key'] ?? ''));
+        update_option('dispatch_messaggio_sender_code', sanitize_text_field($_POST['messaggio_sender_code'] ?? ''));
+        update_option('dispatch_messaggio_api_endpoint', esc_url_raw($_POST['messaggio_api_endpoint'] ?? 'https://api.messaggio.com/v1/sms/send'));
         update_option('dispatch_sms_notification_timing', intval($_POST['sms_notification_timing'] ?? 30));
         // Save SMS Text Templates
         update_option('dispatch_sms_delivery_started_template', sanitize_textarea_field($_POST['sms_delivery_started_template'] ?? ''));
@@ -20549,6 +20882,10 @@ class DispatchDashboard {
         update_option('dispatch_additional_notification_emails', sanitize_textarea_field($_POST['additional_notification_emails'] ?? ''));
         update_option('dispatch_enable_packlist_notifications', sanitize_text_field($_POST['enable_packlist_notifications'] ?? 'no'));
         update_option('dispatch_enable_driver_assignment_notifications', sanitize_text_field($_POST['enable_driver_assignment_notifications'] ?? 'no'));
+
+        // Daily notification report email
+        update_option('dispatch_daily_report_email', sanitize_email($_POST['dispatch_daily_report_email'] ?? ''));
+
         // Firebase settings
         update_option('dispatch_firebase_api_key', sanitize_text_field($_POST['dispatch_firebase_api_key'] ?? ''));
         update_option('dispatch_firebase_auth_domain', sanitize_text_field($_POST['dispatch_firebase_auth_domain'] ?? ''));
@@ -21091,6 +21428,288 @@ class DispatchDashboard {
     /**
      * Render Debug Sequence Page
      */
+
+    /**
+     * Register Nachlieferung Metabox for WooCommerce Orders
+     */
+    public function addNachlieferungMetabox(): void {
+        $screen = class_exists('\Automattic\WooCommerce\Internal\DataStores\Orders\CustomOrdersTableController')
+            && wc_get_container()->get(\Automattic\WooCommerce\Internal\DataStores\Orders\CustomOrdersTableController::class)->custom_orders_table_usage_is_enabled()
+            ? wc_get_page_screen_id('shop-order')
+            : 'shop_order';
+
+        add_meta_box(
+            'dispatch_nachlieferung_metabox',
+            '📦 Nachlieferung erstellen',
+            [$this, 'renderNachlieferungMetabox'],
+            $screen,
+            'side',
+            'default'
+        );
+    }
+
+    /**
+     * Render Nachlieferung Metabox
+     */
+    public function renderNachlieferungMetabox($post_or_order): void {
+        // Get order object (HPOS compatible)
+        if ($post_or_order instanceof WC_Order) {
+            $order = $post_or_order;
+        } else {
+            $order = wc_get_order($post_or_order->ID);
+        }
+
+        if (!$order) {
+            echo '<p>Bestellung nicht gefunden.</p>';
+            return;
+        }
+
+        $order_id = $order->get_id();
+        $items = $order->get_items();
+
+        if (empty($items)) {
+            echo '<p>Keine Artikel in dieser Bestellung.</p>';
+            return;
+        }
+
+        // Check if this is already a Nachlieferung
+        $is_nachlieferung = $order->get_meta('_nachlieferung_original_order');
+        if ($is_nachlieferung) {
+            echo '<p style="color: #666; font-style: italic;">Dies ist bereits eine Nachlieferung zu Bestellung #' . esc_html($is_nachlieferung) . '</p>';
+            return;
+        }
+
+        // Check for existing Nachlieferungen
+        $existing_nachlieferungen = wc_get_orders([
+            'meta_key' => '_nachlieferung_original_order',
+            'meta_value' => $order_id,
+            'return' => 'ids',
+            'limit' => -1,
+        ]);
+
+        if (!empty($existing_nachlieferungen)) {
+            echo '<div style="background: #fff3cd; padding: 8px; border-radius: 4px; margin-bottom: 10px; font-size: 12px;">';
+            echo '<strong>⚠️ Vorhandene Nachlieferungen:</strong><br>';
+            foreach ($existing_nachlieferungen as $nl_id) {
+                echo '<a href="' . esc_url(admin_url('post.php?post=' . $nl_id . '&action=edit')) . '">#' . $nl_id . '</a> ';
+            }
+            echo '</div>';
+        }
+        ?>
+        <style>
+            .nachlieferung-metabox-item {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 6px 0;
+                border-bottom: 1px solid #eee;
+                font-size: 12px;
+            }
+            .nachlieferung-metabox-item:last-child {
+                border-bottom: none;
+            }
+            .nachlieferung-item-name {
+                flex: 1;
+                margin-right: 8px;
+                word-break: break-word;
+            }
+            .nachlieferung-qty-wrapper {
+                display: flex;
+                align-items: center;
+                gap: 4px;
+                white-space: nowrap;
+            }
+            .nachlieferung-qty-input {
+                width: 50px;
+                text-align: center;
+                padding: 4px;
+            }
+            .nachlieferung-qty-input.partial {
+                background: #fff3cd;
+                border-color: #ffc107;
+            }
+            .nachlieferung-comment {
+                width: 100%;
+                margin: 10px 0;
+                padding: 8px;
+                font-size: 12px;
+            }
+            .nachlieferung-btn {
+                width: 100%;
+                padding: 10px;
+                background: #2271b1;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 13px;
+                font-weight: 500;
+            }
+            .nachlieferung-btn:hover {
+                background: #135e96;
+            }
+            .nachlieferung-btn:disabled {
+                background: #ccc;
+                cursor: not-allowed;
+            }
+            .nachlieferung-btn.hidden {
+                display: none;
+            }
+            .nachlieferung-info {
+                font-size: 11px;
+                color: #666;
+                margin-bottom: 10px;
+                padding: 8px;
+                background: #f0f0f1;
+                border-radius: 4px;
+            }
+        </style>
+
+        <div class="nachlieferung-info">
+            Reduziere die gelieferte Menge bei Artikeln, die nicht vollständig geliefert wurden.
+        </div>
+
+        <div id="nachlieferung-items-<?php echo $order_id; ?>">
+            <?php foreach ($items as $item_id => $item):
+                $product = $item->get_product();
+                $qty = $item->get_quantity();
+                $name = $item->get_name();
+                $product_id = $item->get_product_id();
+                $variation_id = $item->get_variation_id();
+                $sku = $product ? $product->get_sku() : '';
+            ?>
+            <div class="nachlieferung-metabox-item"
+                 data-item-id="<?php echo $variation_id ?: $product_id; ?>"
+                 data-item-name="<?php echo esc_attr($name); ?>"
+                 data-item-sku="<?php echo esc_attr($sku); ?>"
+                 data-ordered-qty="<?php echo $qty; ?>">
+                <span class="nachlieferung-item-name"><?php echo esc_html($name); ?></span>
+                <div class="nachlieferung-qty-wrapper">
+                    <input type="number"
+                           class="nachlieferung-qty-input"
+                           min="0"
+                           max="<?php echo $qty; ?>"
+                           value="<?php echo $qty; ?>"
+                           onchange="checkNachlieferungAdmin<?php echo $order_id; ?>()" />
+                    <span>/ <?php echo $qty; ?></span>
+                </div>
+            </div>
+            <?php endforeach; ?>
+        </div>
+
+        <textarea id="nachlieferung-comment-<?php echo $order_id; ?>"
+                  class="nachlieferung-comment"
+                  placeholder="Kommentar (optional)..."
+                  rows="2"></textarea>
+
+        <button type="button"
+                id="nachlieferung-btn-<?php echo $order_id; ?>"
+                class="nachlieferung-btn hidden"
+                onclick="createNachlieferungAdmin<?php echo $order_id; ?>()">
+            📦 Nachlieferung erstellen
+        </button>
+
+        <script>
+        function checkNachlieferungAdmin<?php echo $order_id; ?>() {
+            const container = document.getElementById('nachlieferung-items-<?php echo $order_id; ?>');
+            const items = container.querySelectorAll('.nachlieferung-metabox-item');
+            let hasPartial = false;
+
+            items.forEach(item => {
+                const orderedQty = parseInt(item.dataset.orderedQty);
+                const input = item.querySelector('.nachlieferung-qty-input');
+                const deliveredQty = parseInt(input.value);
+
+                if (deliveredQty < orderedQty) {
+                    hasPartial = true;
+                    input.classList.add('partial');
+                } else {
+                    input.classList.remove('partial');
+                }
+            });
+
+            const btn = document.getElementById('nachlieferung-btn-<?php echo $order_id; ?>');
+            if (hasPartial) {
+                btn.classList.remove('hidden');
+            } else {
+                btn.classList.add('hidden');
+            }
+        }
+
+        function createNachlieferungAdmin<?php echo $order_id; ?>() {
+            const container = document.getElementById('nachlieferung-items-<?php echo $order_id; ?>');
+            const items = container.querySelectorAll('.nachlieferung-metabox-item');
+            const missingItems = [];
+
+            items.forEach(item => {
+                const orderedQty = parseInt(item.dataset.orderedQty);
+                const input = item.querySelector('.nachlieferung-qty-input');
+                const deliveredQty = parseInt(input.value);
+                const missingQty = orderedQty - deliveredQty;
+
+                if (missingQty > 0) {
+                    missingItems.push({
+                        product_id: item.dataset.itemId,
+                        name: item.dataset.itemName,
+                        sku: item.dataset.itemSku,
+                        ordered_qty: orderedQty,
+                        delivered_qty: deliveredQty,
+                        missing_qty: missingQty
+                    });
+                }
+            });
+
+            if (missingItems.length === 0) {
+                alert('Keine fehlenden Artikel gefunden.');
+                return;
+            }
+
+            const comment = document.getElementById('nachlieferung-comment-<?php echo $order_id; ?>').value;
+            const summary = missingItems.map(i => '• ' + i.missing_qty + 'x ' + i.name).join('\n');
+
+            if (!confirm('Nachlieferung erstellen für ' + missingItems.length + ' Artikel?\n\n' + summary + '\n\nKommentar: ' + (comment || '(kein Kommentar)'))) {
+                return;
+            }
+
+            const btn = document.getElementById('nachlieferung-btn-<?php echo $order_id; ?>');
+            const originalText = btn.innerHTML;
+            btn.innerHTML = '⏳ Wird erstellt...';
+            btn.disabled = true;
+
+            fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: new URLSearchParams({
+                    action: 'dispatch_create_nachlieferung',
+                    order_id: '<?php echo $order_id; ?>',
+                    missing_items: JSON.stringify(missingItems),
+                    comment: comment
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    alert('✅ Nachlieferung #' + data.data.new_order_id + ' wurde erstellt!\n\nDer Kunde wurde per E-Mail benachrichtigt.');
+                    location.reload();
+                } else {
+                    alert('❌ Fehler: ' + (data.data?.message || 'Unbekannter Fehler'));
+                    btn.innerHTML = originalText;
+                    btn.disabled = false;
+                }
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('❌ Fehler beim Erstellen der Nachlieferung');
+                btn.innerHTML = originalText;
+                btn.disabled = false;
+            });
+        }
+        </script>
+        <?php
+    }
+
     public function renderDebugSequencePage(): void {
         if (!current_user_can('manage_options')) {
             wp_die('Keine Berechtigung!');
@@ -21155,9 +21774,9 @@ class DispatchDashboard {
             }
         }
 
-        // Build OSRM API request (FREE!)
-        // Format: https://router.project-osrm.org/route/v1/driving/lon1,lat1;lon2,lat2
-        $url = "https://router.project-osrm.org/route/v1/driving/{$origin_lng},{$origin_lat};{$dest_lng},{$dest_lat}?overview=false&steps=false";
+        // Build OSRM API request (FREE!) - use configured server with public fallback
+        $osrm_base = rtrim(get_option('dispatch_osrm_api_url', 'https://router.project-osrm.org'), '/');
+        $url = "{$osrm_base}/route/v1/driving/{$origin_lng},{$origin_lat};{$dest_lng},{$dest_lat}?overview=false&steps=false";
 
         // Make API request with timeout
         $response = wp_remote_get($url, [
@@ -24718,7 +25337,17 @@ class DispatchDashboard {
                 username: '<?php echo isset($current_user) && $current_user ? esc_js($current_user->user_login) : ""; ?>',
                 version: '<?php echo DISPATCH_VERSION; ?>', // Cache busting
                 today_date: '<?php echo (new DateTime('today', wp_timezone()))->format('Y-m-d'); ?>', // Today's date in WP timezone
-                timezone_offset: <?php echo wp_timezone()->getOffset(new DateTime()) / 3600; ?> // Timezone offset in hours (e.g., 2 for UTC+2)
+                timezone_offset: <?php echo wp_timezone()->getOffset(new DateTime()) / 3600; ?>, // Timezone offset in hours (e.g., 2 for UTC+2)
+                pfand_items: <?php
+                    $pfand_items = get_option('dispatch_pfand_items', [
+                        ['id' => 'water', 'icon' => '🍼', 'name' => 'Wasserflasche', 'amount' => 0.25, 'active' => true],
+                        ['id' => 'beer', 'icon' => '🍺', 'name' => 'Bierflasche', 'amount' => 0.50, 'active' => true]
+                    ]);
+                    $active_items = array_filter($pfand_items, function($item) {
+                        return !isset($item['active']) || filter_var($item['active'], FILTER_VALIDATE_BOOLEAN);
+                    });
+                    echo json_encode(array_values($active_items), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT);
+                ?>
             };
 
             // Helper function to get current date/time in WordPress timezone
@@ -26832,7 +27461,7 @@ class DispatchDashboard {
                                 <div class="empty-state-message">${t('loadingOrders')}</div>
                             </div>
                         `;
-                        
+
                         // Load actual orders
                         loadDriverOrders();
 
@@ -27308,6 +27937,17 @@ class DispatchDashboard {
                     return '€' + numericValue.toFixed(2);
                 };
 
+                // Escape string for use in JavaScript (prevents XSS and quote issues)
+                const escapeJs = (str) => {
+                    if (!str) return '';
+                    return String(str)
+                        .replace(/\\/g, '\\\\')
+                        .replace(/'/g, "\\'")
+                        .replace(/"/g, '\\"')
+                        .replace(/\n/g, '\\n')
+                        .replace(/\r/g, '\\r');
+                };
+
                 let detailHTML = `
                     <div class="order-detail-page">
                         <!-- Header with back button -->
@@ -27392,16 +28032,22 @@ class DispatchDashboard {
 
                 // Add order items
                 if (order.items && order.items.length > 0) {
-                    order.items.forEach(item => {
+                    order.items.forEach((item, index) => {
                         // Check if this is a Pfand item
                         const isPfandItem = item.is_pfand ||
                                           item.name.toLowerCase().includes('pfand') ||
                                           item.name.toLowerCase().includes('mehrweg');
 
                         detailHTML += `
-                            <div class="item-card ${isPfandItem ? 'pfand-item' : ''}">
+                            <div class="item-card ${isPfandItem ? 'pfand-item' : ''}" data-item-index="${index}" data-item-id="${item.product_id || item.id}" data-ordered-qty="${item.quantity}" data-item-name="${escapeJs(item.name)}" data-item-sku="${item.sku || ''}">
                                 ${isPfandItem ? '<div class="pfand-icon">🍾</div>' : ''}
-                                <div class="item-quantity">${item.quantity}x</div>
+                                <div class="item-quantity-select">
+                                    <select class="delivered-qty-select" data-index="${index}" onchange="checkNachlieferung(${order.order_id})" title="Gelieferte Menge (von ${item.quantity} bestellt)">
+                                        ${Array.from({length: parseInt(item.quantity) + 1}, (_, i) =>
+                                            `<option value="${i}" ${i === parseInt(item.quantity) ? 'selected' : ''}>${i}x</option>`
+                                        ).join('')}
+                                    </select>
+                                </div>
                                 <div class="item-details">
                                     <div class="item-name">${item.name}</div>
                                     ${item.sku ? `<div class="item-sku">SKU: ${item.sku}</div>` : ''}
@@ -27414,6 +28060,24 @@ class DispatchDashboard {
                 }
 
                 detailHTML += `
+                            </div>
+
+                            <!-- Nachlieferung Section (initially hidden) -->
+                            <div id="nachlieferungSection" class="nachlieferung-section" style="display: none;">
+                                <div class="nachlieferung-warning">
+                                    <span class="warning-icon">⚠️</span>
+                                    <span class="warning-text">Es wurden nicht alle Artikel geliefert!</span>
+                                </div>
+                                <div class="nachlieferung-comment">
+                                    <label for="nachlieferungComment">Kommentar zur Nachlieferung:</label>
+                                    <textarea id="nachlieferungComment" placeholder="Grund für die unvollständige Lieferung..." rows="3"></textarea>
+                                </div>
+                                <button class="action-button nachlieferung-btn" onclick="createNachlieferung(${order.order_id})">
+                                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                                        <path d="M19 7h-8v6h8V7zm2-4H3c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H3V5h18v14z"/>
+                                    </svg>
+                                    🚚 Nachlieferung erstellen
+                                </button>
                             </div>
                         </div>
 
@@ -27501,7 +28165,7 @@ class DispatchDashboard {
                             </button>
                             ` : ''}
 
-                            <button class="action-button payment" onclick="openSumUpPayment(${order.order_id}, '${formatPrice(order.total)}')">
+                            <button class="action-button payment" onclick="openSumUpPayment(${order.order_id}, '${formatPrice(order.net_payment)}', '${escapeJs(order.customer)}')">
                                 <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
                                     <path d="M20 4H4c-1.11 0-1.99.89-1.99 2L2 18c0 1.11.89 2 2 2h16c1.11 0 2-.89 2-2V6c0-1.11-.89-2-2-2zm0 14H4v-6h16v6zm0-10H4V6h16v2z"/>
                                 </svg>
@@ -27514,6 +28178,46 @@ class DispatchDashboard {
                                 </svg>
                                 Als geliefert markieren
                             </button>
+
+                            <button class="action-button danger" onclick="showNichtGeliefertModal(${order.order_id})">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/>
+                                </svg>
+                                ❌ Nicht geliefert
+                            </button>
+                        </div>
+
+                        <!-- Nicht geliefert Modal -->
+                        <div id="nichtGeliefertModal" class="nicht-geliefert-modal" style="display: none;">
+                            <div class="modal-overlay" onclick="closeNichtGeliefertModal()"></div>
+                            <div class="modal-content">
+                                <h3>Grund für Nicht-Lieferung</h3>
+                                <div class="reason-options">
+                                    <label class="reason-option">
+                                        <input type="radio" name="nicht_geliefert_grund" value="kunde_nicht_angetroffen">
+                                        <span class="reason-icon">🚪</span>
+                                        <span class="reason-text">Kunde nicht angetroffen</span>
+                                    </label>
+                                    <label class="reason-option">
+                                        <input type="radio" name="nicht_geliefert_grund" value="lieferung_verweigert">
+                                        <span class="reason-icon">🚫</span>
+                                        <span class="reason-text">Lieferung verweigert</span>
+                                    </label>
+                                    <label class="reason-option">
+                                        <input type="radio" name="nicht_geliefert_grund" value="falsche_adresse">
+                                        <span class="reason-icon">📍</span>
+                                        <span class="reason-text">Falsche Adresse</span>
+                                    </label>
+                                </div>
+                                <div class="modal-comment">
+                                    <label>Kommentar (optional):</label>
+                                    <textarea id="nichtGeliefertComment" placeholder="Zusätzliche Informationen..." rows="2"></textarea>
+                                </div>
+                                <div class="modal-actions">
+                                    <button class="modal-btn cancel" onclick="closeNichtGeliefertModal()">Abbrechen</button>
+                                    <button class="modal-btn confirm" onclick="confirmNichtGeliefert()">Bestätigen</button>
+                                </div>
+                            </div>
                         </div>
                     </div>
 
@@ -27733,6 +28437,245 @@ class DispatchDashboard {
                             font-weight: 500;
                         }
 
+                        /* Nachlieferung - Quantity Select (replaces static quantity) */
+                        .item-quantity-select {
+                            margin-right: 12px;
+                        }
+
+                        .item-quantity-select .delivered-qty-select {
+                            background: #007AFF;
+                            color: white;
+                            border: none;
+                            border-radius: 4px;
+                            padding: 4px 8px;
+                            font-size: 12px;
+                            font-weight: 600;
+                            cursor: pointer;
+                            min-width: 45px;
+                            text-align: center;
+                            appearance: none;
+                            -webkit-appearance: none;
+                            -moz-appearance: none;
+                            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8' viewBox='0 0 8 8'%3E%3Cpath fill='white' d='M0 2l4 4 4-4z'/%3E%3C/svg%3E");
+                            background-repeat: no-repeat;
+                            background-position: right 6px center;
+                            padding-right: 20px;
+                        }
+
+                        .item-quantity-select .delivered-qty-select:focus {
+                            outline: none;
+                            box-shadow: 0 0 0 2px rgba(0,122,255,0.3);
+                        }
+
+                        .item-quantity-select .delivered-qty-select.partial {
+                            background-color: #FFA500;
+                            color: #000;
+                            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8' viewBox='0 0 8 8'%3E%3Cpath fill='black' d='M0 2l4 4 4-4z'/%3E%3C/svg%3E");
+                        }
+
+                        /* Nachlieferung Section */
+                        .nachlieferung-section {
+                            background: linear-gradient(135deg, #3D2C00 0%, #4A3500 100%);
+                            border: 2px solid #FFA500;
+                            border-radius: 12px;
+                            padding: 16px;
+                            margin-top: 16px;
+                        }
+
+                        .nachlieferung-warning {
+                            display: flex;
+                            align-items: center;
+                            gap: 10px;
+                            margin-bottom: 12px;
+                        }
+
+                        .warning-icon {
+                            font-size: 24px;
+                        }
+
+                        .warning-text {
+                            color: #FFA500;
+                            font-weight: 600;
+                            font-size: 16px;
+                        }
+
+                        .nachlieferung-comment {
+                            margin-bottom: 16px;
+                        }
+
+                        .nachlieferung-comment label {
+                            display: block;
+                            color: rgba(255,255,255,0.8);
+                            font-size: 14px;
+                            margin-bottom: 8px;
+                        }
+
+                        .nachlieferung-comment textarea {
+                            width: 100%;
+                            background: #1C1C1E;
+                            color: #ffffff;
+                            border: 1px solid rgba(255,255,255,0.2);
+                            border-radius: 8px;
+                            padding: 12px;
+                            font-size: 14px;
+                            resize: vertical;
+                        }
+
+                        .nachlieferung-comment textarea:focus {
+                            outline: none;
+                            border-color: #FFA500;
+                        }
+
+                        .nachlieferung-btn {
+                            background: linear-gradient(135deg, #FFA500 0%, #FF8C00 100%) !important;
+                            color: #000 !important;
+                            font-weight: 700 !important;
+                        }
+
+                        .nachlieferung-btn:hover {
+                            background: linear-gradient(135deg, #FFB733 0%, #FFA500 100%) !important;
+                        }
+
+                        /* Nicht geliefert Button & Modal */
+                        .action-button.danger {
+                            background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%);
+                            color: white;
+                        }
+
+                        .action-button.danger:hover {
+                            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+                        }
+
+                        .nicht-geliefert-modal {
+                            position: fixed;
+                            top: 0;
+                            left: 0;
+                            right: 0;
+                            bottom: 0;
+                            z-index: 10000;
+                            display: flex;
+                            align-items: center;
+                            justify-content: center;
+                        }
+
+                        .modal-overlay {
+                            position: absolute;
+                            top: 0;
+                            left: 0;
+                            right: 0;
+                            bottom: 0;
+                            background: rgba(0,0,0,0.7);
+                        }
+
+                        .modal-content {
+                            position: relative;
+                            background: #2C2C2E;
+                            border-radius: 16px;
+                            padding: 24px;
+                            max-width: 90%;
+                            width: 350px;
+                            box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+                        }
+
+                        .modal-content h3 {
+                            color: #ffffff;
+                            margin: 0 0 20px 0;
+                            font-size: 18px;
+                            text-align: center;
+                        }
+
+                        .reason-options {
+                            display: flex;
+                            flex-direction: column;
+                            gap: 10px;
+                            margin-bottom: 16px;
+                        }
+
+                        .reason-option {
+                            display: flex;
+                            align-items: center;
+                            gap: 12px;
+                            padding: 14px;
+                            background: #1C1C1E;
+                            border-radius: 10px;
+                            cursor: pointer;
+                            border: 2px solid transparent;
+                            transition: all 0.2s;
+                        }
+
+                        .reason-option:hover {
+                            background: #3C3C3E;
+                        }
+
+                        .reason-option input[type="radio"] {
+                            display: none;
+                        }
+
+                        .reason-option input[type="radio"]:checked + .reason-icon {
+                            transform: scale(1.1);
+                        }
+
+                        .reason-option:has(input:checked) {
+                            border-color: #dc2626;
+                            background: rgba(220, 38, 38, 0.1);
+                        }
+
+                        .reason-icon {
+                            font-size: 24px;
+                        }
+
+                        .reason-text {
+                            color: #ffffff;
+                            font-size: 15px;
+                        }
+
+                        .modal-comment {
+                            margin-bottom: 20px;
+                        }
+
+                        .modal-comment label {
+                            display: block;
+                            color: rgba(255,255,255,0.7);
+                            font-size: 13px;
+                            margin-bottom: 6px;
+                        }
+
+                        .modal-comment textarea {
+                            width: 100%;
+                            background: #1C1C1E;
+                            color: #ffffff;
+                            border: 1px solid rgba(255,255,255,0.2);
+                            border-radius: 8px;
+                            padding: 10px;
+                            font-size: 14px;
+                            resize: none;
+                        }
+
+                        .modal-actions {
+                            display: flex;
+                            gap: 10px;
+                        }
+
+                        .modal-btn {
+                            flex: 1;
+                            padding: 14px;
+                            border: none;
+                            border-radius: 10px;
+                            font-size: 15px;
+                            font-weight: 600;
+                            cursor: pointer;
+                        }
+
+                        .modal-btn.cancel {
+                            background: #3C3C3E;
+                            color: #ffffff;
+                        }
+
+                        .modal-btn.confirm {
+                            background: #dc2626;
+                            color: #ffffff;
+                        }
+
                         .totals-section {
                             background: linear-gradient(135deg, #1C1C1E 0%, #2C2C2E 100%);
                             border: 1px solid rgba(255,255,255,0.1);
@@ -27931,35 +28874,27 @@ class DispatchDashboard {
                 const pfandContainer = document.getElementById('pfandContainer');
                 if (!pfandContainer) return;
 
-                // Check if order has Pfand
+                // Check if order has Pfand in current order
                 const hasPfand = order.pfand_data && order.pfand_data.has_pfand && order.pfand_data.total_pfand > 0;
+                const pfandAmount = hasPfand ? order.pfand_data.total_pfand : 0;
 
-                if (hasPfand) {
-                    // Only display the button, no Pfand details
-                    pfandContainer.innerHTML = `
-                        <div class="pfand-info" style="background: transparent; border: none; border-left: none; padding: 20px;">
-                            <button class="action-button pfand-refund-btn"
-                                    style="width: 100%; background: #46b450; border: none; border-color: #46b450; border-left: none;"
-                                    data-order-id="${order.order_id}"
-                                    data-order-number="${order.order_number}"
-                                    data-customer-name="${order.customer_name}"
-                                    data-customer-email="${order.email || order.customer_email || ''}"
-                                    data-pfand-amount="${order.pfand_data.total_pfand}"
-                                    onclick="handlePfandRefundClick(this)">
-                                <span style="margin-right: 8px;">🔄</span>
-                                Pfand zurückerstatten
-                            </button>
-                        </div>
-                    `;
-                } else {
-                    pfandContainer.innerHTML = `
-                        <div class="pfand-info">
-                            <p style="color: rgba(255,255,255,0.5); text-align: center; padding: 20px;">
-                                Keine Pfand-Artikel in dieser Bestellung
-                            </p>
-                        </div>
-                    `;
-                }
+                // IMMER den Button anzeigen - auch ohne Pfand in aktueller Bestellung
+                // Manuelle Pfand-Erstattung ist immer möglich (z.B. für Kunden mit Pfand-Historie)
+                pfandContainer.innerHTML = `
+                    <div class="pfand-info" style="background: transparent; border: none; border-left: none; padding: 20px;">
+                        <button class="action-button pfand-refund-btn"
+                                style="width: 100%; background: #46b450; border: none; border-color: #46b450; border-left: none;"
+                                data-order-id="${order.order_id}"
+                                data-order-number="${order.order_number}"
+                                data-customer-name="${order.customer_name}"
+                                data-customer-email="${order.email || order.customer_email || ''}"
+                                data-pfand-amount="${pfandAmount}"
+                                onclick="handlePfandRefundClick(this)">
+                            <span style="margin-right: 8px;">🔄</span>
+                            Pfand zurückerstatten
+                        </button>
+                    </div>
+                `;
             }
 
             // Handle Pfand refund button click - mit Fehlerbehandlung
@@ -28514,19 +29449,8 @@ class DispatchDashboard {
                             if (response.success && response.data.history.length > 0) {
                                 displayPfandModal(data, response.data);
                             } else {
-                                $('#pfand-content').show().html(`
-                                    <div style="background:#fff3cd; border:1px solid #ffeaa7; border-radius:5px; padding:15px; margin-bottom:20px;">
-                                        <h4 style="color:#856404; margin:0 0 10px 0;">⚠️ Keine Pfand-Historie gefunden</h4>
-                                        <p style="margin:0; color:#856404;">Für diesen Kunden wurden keine weiteren Bestellungen mit Pfand gefunden.</p>
-                                    </div>
-
-                                    <div style="background:#f8f9fa; padding:15px; border-radius:5px; text-align:center;">
-                                        <p style="color:#1f2937;"><strong>Aktuelle Bestellung:</strong> #${data.orderNumber}</p>
-                                        <p style="color:#1f2937;"><strong>Pfand-Betrag:</strong> €${data.pfandAmount.toFixed(2)}</p>
-                                        <p style="color:#6b7280; font-size:14px;">Diese Bestellung hat Pfand, aber es gibt keine Historie für Rückgaben.</p>
-                                    </div>
-                                `);
-                                $('.pfand-confirm').prop('disabled', true);
+                                // Keine Historie - aber manuelles Pfand sollte möglich sein!
+                                displayPfandModalNoHistory(data);
                             }
                         },
                         error: (xhr, status, error) => {
@@ -28540,6 +29464,140 @@ class DispatchDashboard {
                             `);
                         }
                     });
+                }
+
+                // NEU: Modal für Kunden ohne Pfand-Historie (aber mit manuellem Pfand)
+                function displayPfandModalNoHistory(data) {
+                    const modalContent = `
+                        <div style="background:#fff3cd; border:1px solid #ffeaa7; border-radius:5px; padding:15px; margin-bottom:20px;">
+                            <h4 style="color:#856404; margin:0 0 10px 0;">ℹ️ Keine Pfand-Historie gefunden</h4>
+                            <p style="margin:0; color:#856404;">Für diesen Kunden wurden keine weiteren Bestellungen mit Pfand gefunden.</p>
+                        </div>
+
+                        <div style="background:#f8f9fa; padding:15px; border-radius:5px; margin-bottom:20px;">
+                            <p style="color:#1f2937; margin:0 0 5px 0;"><strong>Aktuelle Bestellung:</strong> #${data.orderNumber}</p>
+                            <p style="color:#1f2937; margin:0;"><strong>Pfand-Betrag:</strong> €${data.pfandAmount.toFixed(2)}</p>
+                        </div>
+
+                        <div style="background:#e8f5e9; border:1px solid #c8e6c9; border-radius:5px; padding:15px; margin-bottom:20px;">
+                            <h4 style="color:#2e7d32; margin:0 0 10px 0;">💡 Manuelles Pfand zurückerstatten</h4>
+                            <p style="margin:0 0 15px 0; color:#2e7d32; font-size:14px;">Auch ohne Historie können Sie Pfand manuell erstatten:</p>
+
+                            <div id="manual-pfand-section" style="background:#f8f9fa; border:1px solid #e5e7eb; padding:12px; border-radius:8px;">
+                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                                    <h4 style="margin:0; display:flex; align-items:center; gap:8px; color:#46b450; font-size:1rem;">
+                                        <span>💰</span>
+                                        <span>Manuelles Pfand hinzufügen</span>
+                                    </h4>
+                                    <button type="button" id="add-manual-pfand-btn" style="background:#46b450; color:white; border:none; border-radius:50%; width:32px; height:32px; font-size:1.2rem; cursor:pointer; display:flex; align-items:center; justify-content:center;">+</button>
+                                </div>
+                                <div id="manual-pfand-items" style="margin-bottom:10px;">
+                                    <div style="color:#6b7280; text-align:center; padding:10px; font-size:0.9rem;">Klicken Sie + um Pfand hinzuzufügen</div>
+                                </div>
+                                <div id="manual-pfand-summary" style="display:none; background:#e8f5e8; padding:10px; border-radius:5px; justify-content:space-between; align-items:center;">
+                                    <span style="color:#374151;">Manuelles Pfand gesamt:</span>
+                                    <span id="manual-pfand-total" style="color:#46b450; font-weight:bold; font-size:1.1rem;">€0.00</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div id="detailed-summary" style="display:none; background:#f0fdf4; border:1px solid #86efac; padding:15px; border-radius:8px; margin-bottom:15px;">
+                            <h4 style="color:#166534; margin:0 0 10px 0;">📋 Zusammenfassung der Rückgabe</h4>
+                            <div id="summary-content"></div>
+                        </div>
+
+                        <div style="background:#f8f9fa; padding:15px; border-radius:5px; margin-bottom:15px;">
+                            <label style="color:#374151; display:block; margin-bottom:8px;">📝 Notiz (optional)</label>
+                            <textarea id="pfand-reason" placeholder="z.B. Kunde reist ab" style="width:100%; padding:10px; border:1px solid #d1d5db; border-radius:5px; resize:vertical; min-height:60px; box-sizing:border-box;"></textarea>
+                        </div>
+
+                        <div style="background:#e0f2fe; padding:10px 15px; border-radius:5px; margin-bottom:15px;">
+                            <p style="margin:0; color:#0369a1; font-size:14px;">ℹ️ Pfandartikel werden als Gutschrift verrechnet.</p>
+                        </div>
+                    `;
+
+                    $('#pfand-content').show().html(modalContent);
+                    $('#pfand-loading').hide();
+
+                    // Button initial deaktiviert (bis manuelles Pfand hinzugefügt wird)
+                    $('.pfand-confirm').prop('disabled', true).text('Bitte Pfand auswählen');
+
+                    // Event Handler für manuelles Pfand
+                    $('#add-manual-pfand-btn').on('click', function() {
+                        addManualPfandRow();
+                        updateNoHistorySummary(data);
+                    });
+
+                    $(document).on('click', '.remove-manual-pfand-btn', function() {
+                        const rowId = $(this).data('row');
+                        $('#' + rowId).remove();
+                        if ($('#manual-pfand-items .manual-pfand-row').length === 0) {
+                            $('#manual-pfand-items').html('<div style="color:#6b7280; text-align:center; padding:10px; font-size:0.9rem;">Klicken Sie + um Pfand hinzuzufügen</div>');
+                            $('#manual-pfand-summary').hide();
+                        }
+                        updateNoHistorySummary(data);
+                    });
+
+                    $(document).on('change', '.manual-pfand-select', function() {
+                        updateManualPfandSummary();
+                        updateNoHistorySummary(data);
+                    });
+
+                    // Confirm Button Handler
+                    $('.pfand-confirm').off('click').on('click', function() {
+                        confirmPfandRefund(data, 'with-order');
+                    });
+                }
+
+                // Update-Funktion für No-History Modal
+                function updateNoHistorySummary(data) {
+                    let totalCredit = 0;
+                    const summaryItems = [];
+
+                    // Sammle manuelle Pfand-Beträge
+                    $('.manual-pfand-select').each(function() {
+                        const pfandValue = parseFloat($(this).val()) || 0;
+                        if (pfandValue > 0) {
+                            totalCredit += pfandValue;
+                            summaryItems.push({
+                                name: 'Manuell: €' + pfandValue.toFixed(2),
+                                quantity: 1,
+                                price: pfandValue,
+                                total: pfandValue
+                            });
+                        }
+                    });
+
+                    // Update Manual Pfand Summary
+                    if (totalCredit > 0) {
+                        $('#manual-pfand-total').text('€' + totalCredit.toFixed(2));
+                        $('#manual-pfand-summary').css('display', 'flex');
+                    } else {
+                        $('#manual-pfand-summary').hide();
+                    }
+
+                    // Update Detailed Summary
+                    if (summaryItems.length > 0) {
+                        let summaryHtml = '<ul style="list-style:none; padding:0; margin:0;">';
+                        summaryItems.forEach(item => {
+                            summaryHtml += `<li style="display:flex; justify-content:space-between; padding:5px 0; border-bottom:1px solid #e5e7eb;">
+                                <span style="color:#374151;">${item.quantity}x ${item.name}</span>
+                                <span style="color:#46b450; font-weight:500;">+€${item.total.toFixed(2)}</span>
+                            </li>`;
+                        });
+                        summaryHtml += `</ul>
+                            <div style="border-top:2px solid #46b450; padding-top:10px; margin-top:10px; text-align:right;">
+                                <strong style="color:#1f2937;">Gesamte Gutschrift: <span style="color:#46b450;">€${totalCredit.toFixed(2)}</span></strong>
+                            </div>`;
+                        $('#summary-content').html(summaryHtml);
+                        $('#detailed-summary').show();
+
+                        // Button aktivieren
+                        $('.pfand-confirm').prop('disabled', false).text(`Verrechnung durchführen (€${totalCredit.toFixed(2)} Gutschrift)`);
+                    } else {
+                        $('#detailed-summary').hide();
+                        $('.pfand-confirm').prop('disabled', true).text('Bitte Pfand auswählen');
+                    }
                 }
 
                 function displayPfandModal(data, historyData) {
@@ -28646,6 +29704,7 @@ class DispatchDashboard {
                         ${generatePfandHistoryHTML(historyData.history)}
                         ${generateMissingBottlesHTML()}
                         ${generateSummaryHTML()}
+                        ${generateManualPfandHTML()}
                         ${generateNotesHTML()}
                     `;
 
@@ -28835,51 +29894,47 @@ class DispatchDashboard {
                 }
 
                 function generateMissingBottlesHTML() {
+                    // Dynamische Pfand-Items aus dispatch_ajax laden (v2.6.2)
+                    const pfandItems = (typeof dispatch_ajax !== 'undefined' && dispatch_ajax.pfand_items)
+                        ? dispatch_ajax.pfand_items
+                        : [
+                            {id: 'water', icon: '🍼', name: 'Wasserflasche', amount: 0.25, active: true},
+                            {id: 'beer', icon: '🍺', name: 'Bierflasche', amount: 0.50, active: true}
+                        ];
+
+                    let itemsHTML = '';
+                    pfandItems.forEach(item => {
+                        if (item.active !== false) {
+                            itemsHTML += `
+                                <div class="pfand-item-row" style="background:white; padding:10px; border-radius:5px;">
+                                    <div class="pfand-item-name">
+                                        <div style="flex:1;">
+                                            <div style="color:#374151; font-size:1rem; font-weight:500;">${item.icon} ${item.name}</div>
+                                            <div style="color:#6b7280; font-size:0.875rem; margin-top:4px;">€${parseFloat(item.amount).toFixed(2)}/Stück</div>
+                                        </div>
+                                    </div>
+                                    <div class="pfand-item-controls">
+                                        <div class="pfand-quantity-control">
+                                            <button type="button" class="pfand-quantity-btn missing-btn minus" data-target="${item.id}" data-amount="${item.amount}" aria-label="Weniger ${item.name}">−</button>
+                                            <input type="number" id="missing-${item.id}" class="pfand-quantity-input missing-input" data-amount="${item.amount}" value="0" min="0" max="99" aria-label="Anzahl fehlende ${item.name}" readonly>
+                                            <button type="button" class="pfand-quantity-btn missing-btn plus" data-target="${item.id}" data-amount="${item.amount}" aria-label="Mehr ${item.name}">+</button>
+                                        </div>
+                                        <div style="min-width:80px; text-align:right;">
+                                            <div style="font-weight:bold; color:#dc3545; font-size:1rem;">€<span id="${item.id}-total">0.00</span></div>
+                                        </div>
+                                    </div>
+                                </div>
+                            `;
+                        }
+                    });
+
                     return `
                         <div id="missing-bottles-section" style="display:none; background:#fff3cd; border:1px solid #ffeaa7; padding:12px; border-radius:8px; margin-bottom:12px;">
                             <h4 style="margin:0 0 8px 0; color:#856404; font-size:1rem;">⚠️ Fehlende Flaschen</h4>
                             <p style="margin:0 0 12px 0; color:#856404; font-size:0.875rem;">Abzug für fehlende Flaschen eingeben:</p>
 
                             <div style="display:flex; flex-direction:column; gap:12px;">
-                                <!-- Wasserflasche -->
-                                <div class="pfand-item-row" style="background:white; padding:10px; border-radius:5px;">
-                                    <div class="pfand-item-name">
-                                        <div style="flex:1;">
-                                            <div style="color:#374151; font-size:1rem; font-weight:500;">🍼 Wasserflasche</div>
-                                            <div style="color:#6b7280; font-size:0.875rem; margin-top:4px;">€0.25/Stück</div>
-                                        </div>
-                                    </div>
-                                    <div class="pfand-item-controls">
-                                        <div class="pfand-quantity-control">
-                                            <button type="button" class="pfand-quantity-btn missing-btn minus" data-target="water" aria-label="Weniger Wasserflaschen">−</button>
-                                            <input type="number" id="missing-water" class="pfand-quantity-input" value="0" min="0" max="99" aria-label="Anzahl fehlende Wasserflaschen" readonly>
-                                            <button type="button" class="pfand-quantity-btn missing-btn plus" data-target="water" aria-label="Mehr Wasserflaschen">+</button>
-                                        </div>
-                                        <div style="min-width:80px; text-align:right;">
-                                            <div style="font-weight:bold; color:#dc3545; font-size:1rem;">€<span id="water-total">0.00</span></div>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                <!-- Bierflasche -->
-                                <div class="pfand-item-row" style="background:white; padding:10px; border-radius:5px;">
-                                    <div class="pfand-item-name">
-                                        <div style="flex:1;">
-                                            <div style="color:#374151; font-size:1rem; font-weight:500;">🍺 Bierflasche</div>
-                                            <div style="color:#6b7280; font-size:0.875rem; margin-top:4px;">€0.50/Stück</div>
-                                        </div>
-                                    </div>
-                                    <div class="pfand-item-controls">
-                                        <div class="pfand-quantity-control">
-                                            <button type="button" class="pfand-quantity-btn missing-btn minus" data-target="beer" aria-label="Weniger Bierflaschen">−</button>
-                                            <input type="number" id="missing-beer" class="pfand-quantity-input" value="0" min="0" max="99" aria-label="Anzahl fehlende Bierflaschen" readonly>
-                                            <button type="button" class="pfand-quantity-btn missing-btn plus" data-target="beer" aria-label="Mehr Bierflaschen">+</button>
-                                        </div>
-                                        <div style="min-width:80px; text-align:right;">
-                                            <div style="font-weight:bold; color:#dc3545; font-size:1rem;">€<span id="beer-total">0.00</span></div>
-                                        </div>
-                                    </div>
-                                </div>
+                                ${itemsHTML}
                             </div>
 
                             <div id="missing-summary" style="display:none; text-align:right; margin-top:15px; padding-top:15px; border-top:1px solid #ffeaa7;">
@@ -28898,6 +29953,75 @@ class DispatchDashboard {
                             </div>
                         </div>
                     `;
+                }
+
+                function generateManualPfandHTML() {
+                    return `
+                        <div id="manual-pfand-section" style="background:#f8f9fa; border:1px solid #e5e7eb; padding:12px; border-radius:8px; margin-bottom:12px;">
+                            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                                <h4 style="margin:0; display:flex; align-items:center; gap:8px; color:#46b450; font-size:1rem;">
+                                    <span>💰</span>
+                                    <span>Manuelles Pfand hinzufügen</span>
+                                </h4>
+                                <button type="button" id="add-manual-pfand-btn" style="background:#46b450; color:white; border:none; border-radius:50%; width:32px; height:32px; font-size:1.2rem; cursor:pointer; display:flex; align-items:center; justify-content:center;">+</button>
+                            </div>
+                            <div id="manual-pfand-items" style="margin-bottom:10px;">
+                                <div style="color:#6b7280; text-align:center; padding:10px; font-size:0.9rem;">Klicken Sie + um Pfand hinzuzufügen</div>
+                            </div>
+                            <div id="manual-pfand-summary" style="display:none; background:#e8f5e8; padding:10px; border-radius:5px; display:flex; justify-content:space-between; align-items:center;">
+                                <span style="color:#374151;">Manuelles Pfand gesamt:</span>
+                                <span id="manual-pfand-total" style="color:#46b450; font-weight:bold; font-size:1.1rem;">€0.00</span>
+                            </div>
+                        </div>
+                    `;
+                }
+
+                let manualPfandCounter = 0;
+
+                function addManualPfandRow() {
+                    manualPfandCounter++;
+                    const rowId = 'manual-pfand-row-' + manualPfandCounter;
+
+                    const rowHTML = `
+                        <div id="${rowId}" class="manual-pfand-row" style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+                            <select class="manual-pfand-select" style="flex:1; padding:10px; border-radius:5px; border:1px solid #d1d5db; background:white; color:#1f2937; font-size:0.95rem;">
+                                <option value="">-- Pfand wählen --</option>
+                                <option value="5.00">5,00 €</option>
+                                <option value="5.50">5,50 €</option>
+                                <option value="6.50">6,50 €</option>
+                                <option value="8.50">8,50 €</option>
+                                <option value="10.00">10,00 €</option>
+                                <option value="12.50">12,50 €</option>
+                                <option value="13.50">13,50 €</option>
+                                <option value="25.00">25,00 €</option>
+                                <option value="30.00">30,00 €</option>
+                                <option value="60.00">60,00 €</option>
+                            </select>
+                            <button type="button" class="remove-manual-pfand-btn" data-row="${rowId}" style="background:#dc3545; color:white; border:none; border-radius:5px; width:36px; height:36px; font-size:1.2rem; cursor:pointer;">×</button>
+                        </div>
+                    `;
+
+                    const container = $('#manual-pfand-items');
+                    if (container.find('.manual-pfand-row').length === 0) {
+                        container.html('');
+                    }
+                    container.append(rowHTML);
+                    $('#manual-pfand-summary').show();
+                }
+
+                function updateManualPfandSummary() {
+                    let manualTotal = 0;
+                    $('.manual-pfand-select').each(function() {
+                        const value = parseFloat($(this).val()) || 0;
+                        manualTotal += value;
+                    });
+
+                    if (manualTotal > 0) {
+                        $('#manual-pfand-total').text('€' + manualTotal.toFixed(2));
+                        $('#manual-pfand-summary').show();
+                    } else {
+                        $('#manual-pfand-summary').hide();
+                    }
                 }
 
                 function generateNotesHTML() {
@@ -29109,6 +30233,29 @@ class DispatchDashboard {
                         updatePfandTotals();
                     });
 
+                    // Manual Pfand Events - Dropdown basiert
+                    $('#add-manual-pfand-btn').on('click', function() {
+                        addManualPfandRow();
+                    });
+
+                    $(document).on('click', '.remove-manual-pfand-btn', function() {
+                        const rowId = $(this).data('row');
+                        $('#' + rowId).remove();
+
+                        if ($('#manual-pfand-items .manual-pfand-row').length === 0) {
+                            $('#manual-pfand-items').html('<div style="color:#6b7280; text-align:center; padding:10px; font-size:0.9rem;">Klicken Sie + um Pfand hinzuzufügen</div>');
+                            $('#manual-pfand-summary').hide();
+                        }
+
+                        updatePfandTotals();
+                        updateManualPfandSummary();
+                    });
+
+                    $(document).on('change', '.manual-pfand-select', function() {
+                        updatePfandTotals();
+                        updateManualPfandSummary();
+                    });
+
                     // Confirm Button Event
                     $('.pfand-confirm').on('click', function() {
                         confirmPfandRefund(data, currentRefundMode);
@@ -29148,40 +30295,53 @@ class DispatchDashboard {
                         }
                     });
 
-                    // Berechne fehlende Flaschen Abzug
+                    // Berechne fehlende Flaschen Abzug - dynamisch aus dispatch_ajax.pfand_items (v2.6.2)
                     let totalDeduction = 0;
-                    const missingWater = parseInt($('#missing-water').val()) || 0;
-                    const missingBeer = parseInt($('#missing-beer').val()) || 0;
+                    const pfandItems = (typeof dispatch_ajax !== 'undefined' && dispatch_ajax.pfand_items)
+                        ? dispatch_ajax.pfand_items
+                        : [
+                            {id: 'water', icon: '🍼', name: 'Wasserflasche', amount: 0.25, active: true},
+                            {id: 'beer', icon: '🍺', name: 'Bierflasche', amount: 0.50, active: true}
+                        ];
 
-                    // Update individual bottle totals
-                    const waterTotal = missingWater * 0.25;
-                    const beerTotal = missingBeer * 0.50;
-                    $('#water-total').text(waterTotal.toFixed(2));
-                    $('#beer-total').text(beerTotal.toFixed(2));
+                    // Iterate über alle konfigurierten Pfand-Items
+                    pfandItems.forEach(item => {
+                        if (item.active !== false) {
+                            const missingCount = parseInt($(`#missing-${item.id}`).val()) || 0;
+                            const itemAmount = parseFloat(item.amount) || 0;
+                            const itemTotal = missingCount * itemAmount;
 
-                    if (missingWater > 0) {
-                        const deduction = missingWater * 0.25;
-                        totalDeduction += deduction;
-                        summaryItems.push({
-                            name: 'Fehlende Wasserflaschen',
-                            quantity: missingWater,
-                            price: -0.25,
-                            total: -deduction,
-                            isDeduction: true
-                        });
-                    }
+                            // Update individual item total display
+                            $(`#${item.id}-total`).text(itemTotal.toFixed(2));
 
-                    if (missingBeer > 0) {
-                        const deduction = missingBeer * 0.50;
-                        totalDeduction += deduction;
-                        summaryItems.push({
-                            name: 'Fehlende Bierflaschen',
-                            quantity: missingBeer,
-                            price: -0.50,
-                            total: -deduction,
-                            isDeduction: true
-                        });
-                    }
+                            if (missingCount > 0) {
+                                totalDeduction += itemTotal;
+                                summaryItems.push({
+                                    name: `Fehlende ${item.name}`,
+                                    quantity: missingCount,
+                                    price: -itemAmount,
+                                    total: -itemTotal,
+                                    isDeduction: true
+                                });
+                            }
+                        }
+                    });
+
+                    // Berechne manuelle Pfand-Beträge (Dropdown-basiert)
+                    $('.manual-pfand-select').each(function() {
+                        const pfandValue = parseFloat($(this).val()) || 0;
+
+                        if (pfandValue > 0) {
+                            totalCredit += pfandValue;
+                            summaryItems.push({
+                                name: 'Manuell: €' + pfandValue.toFixed(2),
+                                quantity: 1,
+                                price: pfandValue,
+                                total: pfandValue,
+                                isManual: true
+                            });
+                        }
+                    });
 
                     const netCredit = Math.max(0, totalCredit - totalDeduction);
 
@@ -29265,7 +30425,7 @@ class DispatchDashboard {
                 }
 
                 function confirmPfandRefund(data, refundMode) {
-                    // Sammle ausgewählte Items
+                    // Sammle ausgewählte Items aus Historie
                     const refundItems = [];
                     $('.pfand-item-checkbox:checked').each(function() {
                         const $checkbox = $(this);
@@ -29284,8 +30444,22 @@ class DispatchDashboard {
                         }
                     });
 
-                    if (refundItems.length === 0) {
-                        alert('Bitte wählen Sie mindestens einen Pfand-Artikel aus.');
+                    // Sammle manuelle Pfand-Beträge
+                    const manualPfandItems = [];
+                    $('.manual-pfand-select').each(function() {
+                        const pfandValue = parseFloat($(this).val()) || 0;
+                        if (pfandValue > 0) {
+                            manualPfandItems.push({
+                                item_name: 'Manuelles Pfand €' + pfandValue.toFixed(2),
+                                quantity: 1,
+                                amount: pfandValue.toFixed(2)
+                            });
+                        }
+                    });
+
+                    // Validierung: Entweder Historie-Items ODER manuelle Items müssen ausgewählt sein
+                    if (refundItems.length === 0 && manualPfandItems.length === 0) {
+                        alert('Bitte wählen Sie mindestens einen Pfand-Artikel aus (Historie oder manuell).');
                         return;
                     }
 
@@ -29315,6 +30489,7 @@ class DispatchDashboard {
                             action: 'dispatch_refund_pfand',
                             current_order_id: data.orderId,
                             refund_items: refundItems,
+                            manual_pfand_items: manualPfandItems,
                             missing_bottles: missingBottles,
                             reason: reason,
                             refund_mode: refundMode,
@@ -31418,36 +32593,274 @@ class DispatchDashboard {
             
             function markOrderDelivered(orderId) {
                 if (confirm('Bestellung als geliefert markieren?')) {
+                    // Show loading indicator
+                    const loadingAlert = document.createElement('div');
+                    loadingAlert.id = 'delivery-loading';
+                    loadingAlert.innerHTML = '<div style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);display:flex;align-items:center;justify-content:center;z-index:9999"><div style="background:white;padding:30px;border-radius:10px;text-align:center"><div style="font-size:24px;margin-bottom:10px">⏳</div><div>Wird verarbeitet...</div></div></div>';
+                    document.body.appendChild(loadingAlert);
+
+                    // Create AbortController for timeout (30 seconds for slow connections)
+                    const controller = new AbortController();
+                    const timeoutId = setTimeout(() => controller.abort(), 30000);
+
                     fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/x-www-form-urlencoded',
                         },
+                        credentials: 'same-origin',
+                        signal: controller.signal,
                         body: new URLSearchParams({
                             action: 'dispatch_mark_delivered',
                             order_id: orderId
                         })
                     })
-                    .then(response => response.json())
+                    .then(response => {
+                        clearTimeout(timeoutId);
+                        // Check for session expiration (401/403) or redirect
+                        if (response.status === 401 || response.status === 403) {
+                            throw new Error('SESSION_EXPIRED');
+                        }
+                        if (!response.ok) {
+                            throw new Error('SERVER_ERROR');
+                        }
+                        // Check content type to ensure we got JSON
+                        const contentType = response.headers.get('content-type');
+                        if (!contentType || !contentType.includes('application/json')) {
+                            // Likely got HTML login page instead of JSON
+                            throw new Error('SESSION_EXPIRED');
+                        }
+                        return response.json();
+                    })
                     .then(data => {
+                        // Remove loading indicator
+                        document.getElementById('delivery-loading')?.remove();
+
                         if (data.success) {
                             alert('✅ Bestellung wurde als geliefert markiert!');
-                            location.reload();
+                            // Redirect to order list instead of reload to avoid issues
+                            window.location.href = '<?php echo home_url('/fahrer-login/dashboard/'); ?>';
                         } else {
-                            alert('❌ Fehler: ' + (data.data?.message || 'Unbekannter Fehler'));
+                            // Check for session/permission errors in response
+                            if (data.data?.code === 'not_logged_in' || data.data?.code === 'no_permission') {
+                                alert('⚠️ Ihre Sitzung ist abgelaufen. Bitte melden Sie sich erneut an.');
+                                window.location.href = '<?php echo home_url('/fahrer-login/'); ?>';
+                            } else {
+                                alert('❌ Fehler: ' + (data.data?.message || 'Unbekannter Fehler'));
+                            }
                         }
                     })
                     .catch(error => {
+                        // Remove loading indicator
+                        document.getElementById('delivery-loading')?.remove();
+                        clearTimeout(timeoutId);
+
                         console.error('Error:', error);
-                        alert('❌ Fehler beim Markieren der Bestellung');
+                        if (error.name === 'AbortError') {
+                            alert('⚠️ Zeitüberschreitung - Bitte prüfen Sie Ihre Internetverbindung und versuchen Sie es erneut.');
+                        } else if (error.message === 'SESSION_EXPIRED') {
+                            alert('⚠️ Ihre Sitzung ist abgelaufen. Bitte melden Sie sich erneut an.');
+                            window.location.href = '<?php echo home_url('/fahrer-login/'); ?>';
+                        } else if (!navigator.onLine) {
+                            alert('⚠️ Keine Internetverbindung. Bitte verbinden Sie sich mit dem Internet und versuchen Sie es erneut.');
+                        } else {
+                            alert('❌ Fehler beim Markieren der Bestellung. Bitte versuchen Sie es erneut.');
+                        }
                     });
                 }
             }
 
-            function openSumUpPayment(orderId, amount) {
+            // Nachlieferung Functions
+            function checkNachlieferung(orderId) {
+                const itemCards = document.querySelectorAll('.item-card[data-ordered-qty]');
+                let hasPartialDelivery = false;
+
+                itemCards.forEach(card => {
+                    const orderedQty = parseInt(card.dataset.orderedQty);
+                    const select = card.querySelector('.delivered-qty-select');
+                    const deliveredQty = parseInt(select.value);
+
+                    if (deliveredQty < orderedQty) {
+                        hasPartialDelivery = true;
+                        select.classList.add('partial');
+                    } else {
+                        select.classList.remove('partial');
+                    }
+                });
+
+                const nachlieferungSection = document.getElementById('nachlieferungSection');
+                if (nachlieferungSection) {
+                    nachlieferungSection.style.display = hasPartialDelivery ? 'block' : 'none';
+                }
+            }
+
+            function createNachlieferung(orderId) {
+                const itemCards = document.querySelectorAll('.item-card[data-ordered-qty]');
+                const missingItems = [];
+
+                itemCards.forEach(card => {
+                    const orderedQty = parseInt(card.dataset.orderedQty);
+                    const select = card.querySelector('.delivered-qty-select');
+                    const deliveredQty = parseInt(select.value);
+                    const missingQty = orderedQty - deliveredQty;
+
+                    if (missingQty > 0) {
+                        missingItems.push({
+                            product_id: card.dataset.itemId,
+                            name: card.dataset.itemName,
+                            sku: card.dataset.itemSku,
+                            ordered_qty: orderedQty,
+                            delivered_qty: deliveredQty,
+                            missing_qty: missingQty
+                        });
+                    }
+                });
+
+                if (missingItems.length === 0) {
+                    alert('Keine fehlenden Artikel gefunden.');
+                    return;
+                }
+
+                const comment = document.getElementById('nachlieferungComment')?.value || '';
+
+                if (!confirm(`Nachlieferung erstellen für ${missingItems.length} Artikel?\n\n` +
+                    missingItems.map(item => `• ${item.missing_qty}x ${item.name}`).join('\n') +
+                    `\n\nKommentar: ${comment || '(kein Kommentar)'}`)) {
+                    return;
+                }
+
+                // Show loading state
+                const btn = document.querySelector('.nachlieferung-btn');
+                const originalText = btn.innerHTML;
+                btn.innerHTML = '⏳ Wird erstellt...';
+                btn.disabled = true;
+
+                fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: new URLSearchParams({
+                        action: 'dispatch_create_nachlieferung',
+                        order_id: orderId,
+                        missing_items: JSON.stringify(missingItems),
+                        comment: comment
+                    })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        alert(`✅ Nachlieferung #${data.data.new_order_id} wurde erstellt!\n\nDer Kunde wurde per E-Mail benachrichtigt.`);
+                        // Reset the dropdowns
+                        document.querySelectorAll('.delivered-qty-select').forEach(select => {
+                            select.value = select.closest('.item-card').dataset.orderedQty;
+                            select.classList.remove('partial');
+                        });
+                        document.getElementById('nachlieferungSection').style.display = 'none';
+                        document.getElementById('nachlieferungComment').value = '';
+                    } else {
+                        alert('❌ Fehler: ' + (data.data?.message || 'Unbekannter Fehler'));
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    alert('❌ Fehler beim Erstellen der Nachlieferung');
+                })
+                .finally(() => {
+                    btn.innerHTML = originalText;
+                    btn.disabled = false;
+                });
+            }
+
+            // Nicht geliefert Modal Functions
+            let currentNichtGeliefertOrderId = null;
+
+            function showNichtGeliefertModal(orderId) {
+                currentNichtGeliefertOrderId = orderId;
+                document.getElementById('nichtGeliefertModal').style.display = 'flex';
+                // Reset form
+                document.querySelectorAll('input[name="nicht_geliefert_grund"]').forEach(r => r.checked = false);
+                document.getElementById('nichtGeliefertComment').value = '';
+            }
+
+            function closeNichtGeliefertModal() {
+                document.getElementById('nichtGeliefertModal').style.display = 'none';
+                currentNichtGeliefertOrderId = null;
+            }
+
+            function confirmNichtGeliefert() {
+                const selectedReason = document.querySelector('input[name="nicht_geliefert_grund"]:checked');
+                if (!selectedReason) {
+                    alert('Bitte wähle einen Grund aus.');
+                    return;
+                }
+
+                const reason = selectedReason.value;
+                const comment = document.getElementById('nichtGeliefertComment').value;
+
+                const reasonLabels = {
+                    'kunde_nicht_angetroffen': 'Kunde nicht angetroffen',
+                    'lieferung_verweigert': 'Lieferung verweigert',
+                    'falsche_adresse': 'Falsche Adresse'
+                };
+
+                if (!confirm(`Bestellung als "Nicht geliefert" markieren?\n\nGrund: ${reasonLabels[reason]}\n${comment ? 'Kommentar: ' + comment : ''}`)) {
+                    return;
+                }
+
+                // Show loading
+                const confirmBtn = document.querySelector('.modal-btn.confirm');
+                confirmBtn.textContent = 'Wird verarbeitet...';
+                confirmBtn.disabled = true;
+
+                fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: new URLSearchParams({
+                        action: 'dispatch_nicht_geliefert',
+                        order_id: currentNichtGeliefertOrderId,
+                        reason: reason,
+                        comment: comment
+                    })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        alert('✅ Bestellung wurde als "Nicht geliefert" markiert.\n\nDie Bestellung wurde an die Disposition zurückgegeben.');
+                        closeNichtGeliefertModal();
+                        // Reload orders list
+                        loadDriverOrders();
+                    } else {
+                        alert('❌ Fehler: ' + (data.data?.message || 'Unbekannter Fehler'));
+                    }
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    alert('❌ Fehler beim Verarbeiten');
+                })
+                .finally(() => {
+                    confirmBtn.textContent = 'Bestätigen';
+                    confirmBtn.disabled = false;
+                });
+            }
+
+            function openSumUpPayment(orderId, amount, customerName = '') {
                 // Remove € symbol and convert to cents for SumUp
                 const numericAmount = parseFloat(amount.replace('€', '').trim());
                 const amountInCents = Math.round(numericAmount * 100);
+
+                // Detect platform
+                const isAndroid = /Android/i.test(navigator.userAgent);
+                const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+
+                // Build transaction title with order ID and customer name
+                let transactionTitle = `#${orderId}`;
+                if (customerName && customerName.trim()) {
+                    transactionTitle += ` - ${customerName.trim()}`;
+                }
+                const encodedTitle = encodeURIComponent(transactionTitle);
 
                 // Get current user's SumUp affiliate key from user meta
                 const userId = '<?php echo get_current_user_id(); ?>';
@@ -31466,13 +32879,23 @@ class DispatchDashboard {
                 .then(response => response.json())
                 .then(data => {
                     if (data.success && data.data.affiliate_key) {
-                        // Build SumUp URL
-                        const callbackSuccess = encodeURIComponent(window.location.href + '?sumup_success=1&order_id=' + orderId);
-                        const callbackFail = encodeURIComponent(window.location.href + '?sumup_fail=1&order_id=' + orderId);
+                        // Build SumUp URL WITHOUT callbacks (PWA doesn't support redirects)
+                        // SumUp expects amount in EUR with decimal point, not cents
+                        const amountInEur = (amountInCents / 100).toFixed(2);
+                        const affiliateKey = data.data.affiliate_key;
 
-                        const sumupUrl = `sumupmerchant://pay/1.0?affiliate-key=${data.data.affiliate_key}&app-id=de.absa.driver&total=${amountInCents}&currency=EUR&title=Bestellung%20${orderId}&callbacksuccess=${callbackSuccess}&callbackfail=${callbackFail}&foreign-tx-id=${orderId}`;
+                        let sumupUrl;
+                        if (isAndroid) {
+                            // Android: Use Intent URL for better app handling
+                            const params = `affiliate-key=${affiliateKey}&amount=${amountInEur}&currency=EUR&title=${encodedTitle}&foreign-tx-id=${orderId}`;
+                            sumupUrl = `intent://pay/1.0?${params}#Intent;scheme=sumupmerchant;package=com.sumup.merchant;end`;
+                            console.log('Opening SumUp (Android Intent):', sumupUrl);
+                        } else {
+                            // iOS and others: Use standard URL scheme
+                            sumupUrl = `sumupmerchant://pay/1.0?affiliate-key=${affiliateKey}&amount=${amountInEur}&currency=EUR&title=${encodedTitle}&foreign-tx-id=${orderId}`;
+                            console.log('Opening SumUp (iOS):', sumupUrl);
+                        }
 
-                        console.log('Opening SumUp with URL:', sumupUrl);
                         window.location.href = sumupUrl;
                     } else {
                         alert('❌ SumUp Zugangsdaten nicht konfiguriert. Bitte kontaktieren Sie den Administrator.');
@@ -38459,6 +39882,8 @@ ${username}`);
      * Calculate pfand summary statistics from Germanized data
      */
     private function calculatePfandSummaryFromGermanized(): array {
+        global $wpdb;
+
         $customers = $this->getPfandCustomersWithOutstandingBalance();
 
         $totalBalance = 0;
@@ -38474,11 +39899,31 @@ ${username}`);
         $activeCustomers = count($customers);
         $averageBalance = $activeCustomers > 0 ? $totalBalance / $activeCustomers : 0;
 
+        // Calculate total refunded by drivers (sum of all _pfand_refund_amount)
+        $totalRefunded = $wpdb->get_var(
+            "SELECT COALESCE(SUM(CAST(meta_value AS DECIMAL(10,2))), 0)
+             FROM {$wpdb->postmeta}
+             WHERE meta_key = '_pfand_refund_amount'
+             AND meta_value > 0"
+        );
+
+        // Count orders with pending pfand (has pfand items but not refunded)
+        $pendingRefundCount = $wpdb->get_var(
+            "SELECT COUNT(DISTINCT pm1.post_id)
+             FROM {$wpdb->postmeta} pm1
+             LEFT JOIN {$wpdb->postmeta} pm2 ON pm1.post_id = pm2.post_id AND pm2.meta_key = '_pfand_refunded'
+             WHERE pm1.meta_key = '_has_pfand_items'
+             AND pm1.meta_value = '1'
+             AND (pm2.meta_value IS NULL OR pm2.meta_value != 'yes')"
+        );
+
         return [
             'total_balance' => $totalBalance,
             'active_customers' => $activeCustomers,
             'critical_count' => $criticalCount,
             'average_balance' => $averageBalance,
+            'total_refunded' => (float) ($totalRefunded ?: 0),
+            'pending_refund_count' => (int) ($pendingRefundCount ?: 0),
             'monthly_volume' => 0 // Placeholder - could be calculated if needed
         ];
     }
@@ -38877,6 +40322,19 @@ Ihr Lieferteam',
 
         $result = wp_mail($to, $subject, $body, $headers);
 
+        // Log notification for daily report
+        $customer_name = $order->get_billing_first_name() . ' ' . $order->get_billing_last_name();
+        $this->logNotification(
+            'email',
+            $type, // event type (e.g., 'rating_request')
+            $order_id,
+            $to,
+            $customer_name,
+            $result,
+            $subject,
+            $result ? '' : 'wp_mail returned false'
+        );
+
         if ($result) {
             error_log("✅ wp_mail returned SUCCESS");
         } else {
@@ -39014,7 +40472,7 @@ Ihr Lieferteam',
                 $driver_data[] = [
                     'id' => $driver->ID,
                     'name' => $driver->display_name ?: ($driver->first_name . ' ' . $driver->last_name),
-                    'status' => $driver_status,
+                    'online_status' => $driver_status,  // FIX v2.9.93: JavaScript expects online_status, not status
                     'orders_count' => $orders_count,
                     'completed' => $completed_count,
                     'distance' => ($orders_count * 2) . ' km', // Rough estimate
@@ -39388,6 +40846,11 @@ Ihr Lieferteam',
             // Add to results if we have valid coordinates
             if ($latitude && $longitude) {
                 $location_age = $current_time - ($timestamp ?? 0);
+
+                // v2.9.89: Use actual online_status from user meta (set by Traccar sync)
+                // Instead of always showing "online" for all drivers with coordinates
+                $actual_online_status = $online_status ?: 'offline';
+
                 $driver_locations[] = [
                     'driver_id' => $driver->ID,
                     'driver_name' => $full_name,
@@ -39396,7 +40859,7 @@ Ihr Lieferteam',
                     'longitude' => $longitude,
                     'timestamp' => $timestamp,
                     'accuracy' => $accuracy,
-                    'online_status' => 'online',
+                    'online_status' => $actual_online_status,
                     'age_minutes' => round($location_age / 60, 1),
                     'source' => $source
                 ];
@@ -40118,13 +41581,22 @@ Ihr Lieferteam',
                 $order->delete_meta_data('_delivery_started_at');
                 $order->delete_meta_data('_delivery_status');
 
+                // ✅ FIX 17.12.2025: Reset ALL notification flags to allow fresh notifications
+                // Without this, orders from previous days would show "already sent"
+                $order->delete_meta_data('_delivery_started_notification_sent');
+                $order->delete_meta_data('_delivery_started_notification_sent_at');
+                $order->delete_meta_data('_driver_nearby_sms_sent');
+                $order->delete_meta_data('_driver_nearby_sms_sent_at');
+                $order->delete_meta_data('_delivered_sms_sent');
+                $order->delete_meta_data('_delivered_sms_sent_at');
+
                 $order->save();
                 $unassigned_count++;
-                error_log("Midnight Cleanup: Unassigned driver and reset 'Geladen' status for order #{$order_id} (delivery date: {$delivery_date})");
+                error_log("Midnight Cleanup: Reset order #{$order_id} - driver unassigned, status cleared, notification flags reset (delivery date: {$delivery_date})");
             }
         }
 
-        error_log("Midnight Cleanup completed: {$unassigned_count} drivers unassigned from incomplete orders");
+        error_log("Midnight Cleanup completed: {$unassigned_count} orders reset (driver unassigned + notification flags cleared)");
     }
     
     /**
@@ -40208,178 +41680,6 @@ Ihr Lieferteam',
                 $order->save();
             }
         }
-    }
-    /**
-     * AUTO-FIX: Calculate KM/ETA if coordinates exist but distance is missing
-     * Called from clearCacheForUpdatedOrder to ensure KM/ETA is always calculated
-     * when Plus Code is added later by admin
-     *
-     * @param WC_Order $order
-     * @return void
-     */
-    private function maybeCalculateDistanceForOrder($order): void {
-        if (!$order) {
-            return;
-        }
-
-        $order_id = $order->get_id();
-
-        // Check if distance already calculated
-        $existing_distance = $order->get_meta('lpac_customer_distance');
-        if (!empty($existing_distance) && floatval($existing_distance) > 0) {
-            return; // Already has distance, skip
-        }
-
-        $customer_id = $order->get_customer_id();
-        $customer_lat = null;
-        $customer_lng = null;
-        $coord_source = null;
-        $user_plus_code = null;
-
-        // ========================================
-        // STEP 1: ZUERST Benutzerprofil prüfen (Plus Code)
-        // ========================================
-        if ($customer_id > 0) {
-            $user_plus_code = get_user_meta($customer_id, 'plus_code', true);
-            if (empty($user_plus_code) || $user_plus_code === 'NONE' || $user_plus_code === 'none') {
-                $user_plus_code = get_user_meta($customer_id, 'billing_pluscode', true);
-            }
-
-            // Decode Plus Code if valid (must contain '+' and not be 'NONE')
-            if (!empty($user_plus_code) && $user_plus_code !== 'NONE' && $user_plus_code !== 'none' && strpos($user_plus_code, '+') !== false) {
-                $coords = $this->plusCodeToCoordinates($user_plus_code);
-                if ($coords) {
-                    $customer_lat = $coords['lat'];
-                    $customer_lng = $coords['lng'];
-                    $coord_source = 'user_profile';
-
-                    // Save coordinates to order
-                    $order->update_meta_data('billing_latitude', $customer_lat);
-                    $order->update_meta_data('billing_longitude', $customer_lng);
-                    $order->update_meta_data('plus_code', $user_plus_code);
-                    $order->update_meta_data('plus_code_source', 'user_profile');
-                    error_log("maybeCalculateDistanceForOrder: Order #{$order_id} - STEP 1: Plus Code from user profile: {$user_plus_code}");
-                }
-            }
-        }
-
-        // ========================================
-        // STEP 2: Falls kein Plus Code im Profil → Lieferadresse prüfen
-        // ========================================
-        if (empty($customer_lat) || empty($customer_lng)) {
-            $shipping_lat = $order->get_meta('_shipping_latitude') ?: $order->get_meta('lpac_latitude');
-            $shipping_lng = $order->get_meta('_shipping_longitude') ?: $order->get_meta('lpac_longitude');
-
-            if (!empty($shipping_lat) && !empty($shipping_lng)) {
-                $customer_lat = $shipping_lat;
-                $customer_lng = $shipping_lng;
-                $coord_source = 'shipping_address';
-                error_log("maybeCalculateDistanceForOrder: Order #{$order_id} - STEP 2: Coordinates from shipping address");
-            }
-        }
-
-        // ========================================
-        // STEP 3: Falls keine Lieferadresse → Rechnungsadresse prüfen
-        // ========================================
-        if (empty($customer_lat) || empty($customer_lng)) {
-            $billing_lat = $order->get_meta('billing_latitude');
-            $billing_lng = $order->get_meta('billing_longitude');
-
-            if (!empty($billing_lat) && !empty($billing_lng)) {
-                $customer_lat = $billing_lat;
-                $customer_lng = $billing_lng;
-                $coord_source = 'billing_address';
-                error_log("maybeCalculateDistanceForOrder: Order #{$order_id} - STEP 3: Coordinates from billing address");
-            }
-        }
-
-        // ========================================
-        // STEP 4: Bei >100m Abweichung vom Profil-Plus Code → Warnung
-        // ========================================
-        if (!empty($user_plus_code) && $coord_source !== 'user_profile') {
-            // We have profile Plus Code but used address coordinates
-            $profile_coords = $this->plusCodeToCoordinates($user_plus_code);
-            if ($profile_coords && !empty($customer_lat) && !empty($customer_lng)) {
-                $deviation_m = $this->calculateHaversineDistance(
-                    $profile_coords['lat'], $profile_coords['lng'],
-                    floatval($customer_lat), floatval($customer_lng)
-                ) * 1000; // Convert km to m
-
-                if ($deviation_m > 100) {
-                    error_log("⚠️ maybeCalculateDistanceForOrder: Order #{$order_id} - ADDRESS DEVIATION: {$deviation_m}m from profile Plus Code!");
-                    $order->add_order_note(sprintf(
-                        '⚠️ Adressabweichung: Die Lieferadresse weicht %dm vom Plus Code im Kundenprofil ab!',
-                        round($deviation_m)
-                    ));
-                }
-            }
-        }
-
-        // Still no coordinates? Nothing to calculate
-        if (empty($customer_lat) || empty($customer_lng)) {
-            error_log("maybeCalculateDistanceForOrder: Order #{$order_id} - No coordinates found, skipping");
-            return;
-        }
-
-        // Get depot coordinates from settings
-        $depot_lat = get_option('dispatch_depot_latitude', '39.4887003');
-        $depot_lng = get_option('dispatch_depot_longitude', '2.8970119');
-
-        if (empty($depot_lat) || empty($depot_lng)) {
-            error_log("maybeCalculateDistanceForOrder: Order #{$order_id} - Missing depot coordinates!");
-            return;
-        }
-
-        // Calculate distance using OSRM
-        $osrm_url = get_option('dispatch_osrm_api_url', 'http://91.98.17.58:5000');
-        $route_url = "{$osrm_url}/route/v1/driving/{$depot_lng},{$depot_lat};{$customer_lng},{$customer_lat}?overview=false";
-
-        $context = stream_context_create(['http' => ['timeout' => 5]]);
-        $response = @file_get_contents($route_url, false, $context);
-
-        if ($response !== false) {
-            $data = json_decode($response, true);
-            if (isset($data['routes'][0])) {
-                $route = $data['routes'][0];
-                $distance_km = round($route['distance'] / 1000, 1);
-                $eta_minutes = round($route['duration'] / 60);
-
-                // Save to order - all meta keys for compatibility
-                $order->update_meta_data('lpac_customer_distance', $distance_km);
-                $order->update_meta_data('lpac_customer_distance_unit', 'km');
-                $order->update_meta_data('lpac_customer_distance_duration', $eta_minutes . ' mins');
-                $order->update_meta_data('lpac_latitude', $customer_lat);
-                $order->update_meta_data('lpac_longitude', $customer_lng);
-                $order->update_meta_data('_delivery_distance_km', $distance_km);
-                $order->update_meta_data('_delivery_eta_minutes', $eta_minutes);
-                $order->update_meta_data('_dispatch_distance_calculated', 'osrm');
-                $order->update_meta_data('_dispatch_distance_calculated_at', current_time('mysql'));
-                $order->save();
-
-                error_log("✅ AUTO-FIX (OSRM): Order #{$order_id} - KM/ETA calculated: {$distance_km} km / {$eta_minutes} mins (source: {$coord_source})");
-                return;
-            }
-        }
-
-        // Fallback: Haversine calculation
-        $distance_km = $this->calculateHaversineDistance(
-            floatval($depot_lat), floatval($depot_lng),
-            floatval($customer_lat), floatval($customer_lng)
-        );
-        $eta_minutes = round(($distance_km / 40) * 60); // 40 km/h average
-
-        $order->update_meta_data('lpac_customer_distance', round($distance_km, 1));
-        $order->update_meta_data('lpac_customer_distance_unit', 'km');
-        $order->update_meta_data('lpac_customer_distance_duration', $eta_minutes . ' mins');
-        $order->update_meta_data('lpac_latitude', $customer_lat);
-        $order->update_meta_data('lpac_longitude', $customer_lng);
-        $order->update_meta_data('_delivery_distance_km', round($distance_km, 1));
-        $order->update_meta_data('_delivery_eta_minutes', $eta_minutes);
-        $order->update_meta_data('_dispatch_distance_calculated', 'haversine');
-        $order->update_meta_data('_dispatch_distance_calculated_at', current_time('mysql'));
-        $order->save();
-
-        error_log("✅ AUTO-FIX (Haversine): Order #{$order_id} - KM/ETA calculated: " . round($distance_km, 1) . " km / {$eta_minutes} mins (source: {$coord_source})");
     }
 
     /**
@@ -40471,13 +41771,6 @@ Ihr Lieferteam',
         if (!$order_id) {
             $order_id = $order->get_id();
         }
-
-        // ========================================
-        // AUTO-FIX: Calculate KM/ETA if missing but coordinates available
-        // This ensures KM/ETA is calculated when Plus Code is added later by admin
-        // ========================================
-        $this->maybeCalculateDistanceForOrder($order);
-
 
         // ========================================
         // DEBUG: Track which hook called this and check suppression
@@ -40601,6 +41894,74 @@ Ihr Lieferteam',
 
             // Also clear for specific order
             $this->clearCacheForUpdatedOrder($object_id);
+        }
+    }
+
+    /**
+     * Recalculate distance when Plus Code is changed
+     * This ensures that when admin manually updates the Plus Code, the distance is recalculated via OSRM
+     *
+     * @param int $meta_id The meta ID
+     * @param int $object_id The order ID
+     * @param string $meta_key The meta key being updated
+     * @param mixed $meta_value The new meta value
+     */
+    public function recalculateDistanceOnPlusCodeChange($meta_id, $object_id, $meta_key, $meta_value): void {
+        // Only process shop_order posts
+        if (get_post_type($object_id) !== 'shop_order') {
+            return;
+        }
+
+        // List of Plus Code meta keys that should trigger recalculation
+        $plus_code_meta_keys = [
+            '_billing_plus_code',
+            'plus_code',
+            'lpac_plus_code',
+            '_shipping_plus_code',
+            '_plus_code'
+        ];
+
+        // Check if this is a Plus Code update
+        if (!in_array($meta_key, $plus_code_meta_keys)) {
+            return;
+        }
+
+        // Validate the Plus Code format
+        if (empty($meta_value) || !preg_match('/^[23456789CFGHJMPQRVWX]{8}\+[23456789CFGHJMPQRVWX]{2,}$/', $meta_value)) {
+            error_log("recalculateDistanceOnPlusCodeChange: Order #{$object_id} - Invalid Plus Code format: {$meta_value}");
+            return;
+        }
+
+        error_log("recalculateDistanceOnPlusCodeChange: Order #{$object_id} - Plus Code changed to: {$meta_value}");
+
+        // Get the order
+        $order = wc_get_order($object_id);
+        if (!$order) {
+            return;
+        }
+
+        // Delete the existing distance to force recalculation
+        $old_distance = $order->get_meta('lpac_customer_distance');
+        if (!empty($old_distance)) {
+            $order->delete_meta_data('lpac_customer_distance');
+            $order->delete_meta_data('lpac_customer_distance_unit');
+            $order->delete_meta_data('lpac_customer_distance_duration');
+            $order->delete_meta_data('_dispatch_distance_calculated');
+            $order->delete_meta_data('_dispatch_distance_source');
+            $order->save();
+            error_log("recalculateDistanceOnPlusCodeChange: Order #{$object_id} - Deleted old distance: {$old_distance} km");
+        }
+
+        // Recalculate the distance using OSRM
+        $success = $this->calculateWarehouseDistance($order);
+
+        if ($success) {
+            // Refresh the order to get the new distance
+            $order = wc_get_order($object_id);
+            $new_distance = $order->get_meta('lpac_customer_distance');
+            error_log("recalculateDistanceOnPlusCodeChange: Order #{$object_id} - SUCCESS! New distance: {$new_distance} km");
+        } else {
+            error_log("recalculateDistanceOnPlusCodeChange: Order #{$object_id} - Distance calculation FAILED");
         }
     }
 
@@ -41185,70 +42546,24 @@ Ihr Lieferteam',
         $assigned_at = $order->get_meta('_driver_assigned_at');
         $order_ready = $order->get_meta('_order_ready') === 'yes';
 
-        // Get delivery address coordinates (5-tier priority)
-        // PRIORITY 1 (HIGHEST): Plus Code from USER PROFILE (Stammkunde)
-        // Regular customers have their Plus Code stored in user meta - this ALWAYS takes priority
-        $customer_lat = null;
-        $customer_lng = null;
-        $customer_id = $order->get_customer_id();
+        // Get delivery address coordinates (3-tier priority)
+        // Priority 1: LPAC coordinates (most accurate)
+        $customer_lat = $order->get_meta('lpac_latitude');
+        $customer_lng = $order->get_meta('lpac_longitude');
 
-        if ($customer_id > 0) {
-            $user_plus_code = get_user_meta($customer_id, 'plus_code', true);
-            if (!empty($user_plus_code)) {
-                $coords = $this->plusCodeToCoordinates($user_plus_code);
-                if ($coords) {
-                    $customer_lat = $coords['lat'];
-                    $customer_lng = $coords['lng'];
-                    error_log("renderCustomerTracking: Order #{$order_id} - Using Plus Code from USER PROFILE: {$user_plus_code}");
-                }
-            }
-        } else {
-            // Guest order - try to find user by email
-            $email = $order->get_billing_email();
-            if (!empty($email)) {
-                $user = get_user_by('email', $email);
-                if ($user) {
-                    $user_plus_code = get_user_meta($user->ID, 'plus_code', true);
-                    if (!empty($user_plus_code)) {
-                        $coords = $this->plusCodeToCoordinates($user_plus_code);
-                        if ($coords) {
-                            $customer_lat = $coords['lat'];
-                            $customer_lng = $coords['lng'];
-                            error_log("renderCustomerTracking: Order #{$order_id} - Guest order, using Plus Code from user profile (found by email): {$user_plus_code}");
-                        }
-                    }
-                }
-            }
-        }
-
-        // Priority 2: LPAC coordinates (if no user profile Plus Code)
-        if (empty($customer_lat) || empty($customer_lng)) {
-            $customer_lat = $order->get_meta('lpac_latitude');
-            $customer_lng = $order->get_meta('lpac_longitude');
-            if (!empty($customer_lat) && !empty($customer_lng)) {
-                error_log("renderCustomerTracking: Order #{$order_id} - Using LPAC coordinates");
-            }
-        }
-
-        // Priority 3: Shipping coordinates (from geocoding/manual entry)
+        // Priority 2: Shipping coordinates (from geocoding/manual entry)
         if (empty($customer_lat) || empty($customer_lng)) {
             $customer_lat = $order->get_meta('_shipping_latitude');
             $customer_lng = $order->get_meta('_shipping_longitude');
-            if (!empty($customer_lat) && !empty($customer_lng)) {
-                error_log("renderCustomerTracking: Order #{$order_id} - Using Shipping coordinates");
-            }
         }
 
-        // Priority 4: Billing coordinates (fallback)
+        // Priority 3: Billing coordinates (fallback)
         if (empty($customer_lat) || empty($customer_lng)) {
             $customer_lat = $order->get_meta('billing_latitude');
             $customer_lng = $order->get_meta('billing_longitude');
-            if (!empty($customer_lat) && !empty($customer_lng)) {
-                error_log("renderCustomerTracking: Order #{$order_id} - Using Billing coordinates");
-            }
         }
 
-        // Priority 5 (LOWEST): Plus Code from order meta fields or address
+        // Priority 4: Plus Code from meta fields or address
         if (empty($customer_lat) || empty($customer_lng)) {
             // Try Plus Code from meta fields first
             $plus_code = $order->get_meta('plus_code') ?: $order->get_meta('_billing_plus_code') ?: $order->get_meta('_shipping_plus_code');
@@ -41270,7 +42585,12 @@ Ihr Lieferteam',
                 if ($coords) {
                     $customer_lat = $coords['lat'];
                     $customer_lng = $coords['lng'];
-                    error_log("renderCustomerTracking: Order #{$order_id} - Using Plus Code from order meta/address: {$plus_code}");
+                    // Save coordinates for future use
+                    $order->update_meta_data('lpac_latitude', $customer_lat);
+                    $order->update_meta_data('lpac_longitude', $customer_lng);
+                    $order->update_meta_data('_shipping_latitude', $customer_lat);
+                    $order->update_meta_data('_shipping_longitude', $customer_lng);
+                    $order->save();
                 }
             }
         }
@@ -41724,8 +43044,13 @@ Ihr Lieferteam',
                     }
                 }
 
-                // Update driver location and map
-                function updateDriverLocation() {
+                // v2.9.92: Retry mechanism for driver location
+                let locationRetryCount = 0;
+                const maxRetries = 3;
+                const retryDelay = 2000; // 2 seconds between retries
+
+                // Update driver location and map (with retry support)
+                function updateDriverLocation(isRetry = false) {
                     if (!driverId) {
                         console.log('No driver ID, skipping location update');
                         document.getElementById('eta-display').textContent = 'Fahrer noch nicht zugewiesen';
@@ -41733,25 +43058,38 @@ Ihr Lieferteam',
                         return;
                     }
 
+                    // Show loading state on first attempt
+                    if (!isRetry) {
+                        locationRetryCount = 0;
+                    }
+
+                    const etaDisplay = document.getElementById('eta-display');
+                    if (locationRetryCount > 0) {
+                        etaDisplay.innerHTML = 'Wird berechnet... <small>(Versuch ' + (locationRetryCount + 1) + '/' + maxRetries + ')</small>';
+                    }
+
                     fetch('<?php echo admin_url('admin-ajax.php'); ?>', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                        body: 'action=dispatch_get_driver_location&driver_id=' + driverId + '&order_id=' + orderId
+                        body: 'action=dispatch_get_driver_location&driver_id=' + driverId + '&order_id=' + orderId,
+                        cache: 'no-store' // Prevent caching issues
                     })
-                    .then(response => response.json())
+                    .then(response => {
+                        if (!response.ok) {
+                            throw new Error('HTTP ' + response.status);
+                        }
+                        return response.json();
+                    })
                     .then(data => {
                         console.log('Driver location response:', data);
 
                         // v2.9.80: Check if order was delivered - reload page to show delivered state
                         if (data.success && data.data.order_delivered) {
                             console.log('Order has been delivered! Reloading page...');
-                            // Show brief message before reload
-                            const etaDisplay = document.getElementById('eta-display');
                             if (etaDisplay) {
                                 etaDisplay.innerHTML = '✅ <strong>Zugestellt!</strong>';
                                 etaDisplay.style.color = '#10b981';
                             }
-                            // Reload page after short delay to show delivered state
                             setTimeout(() => {
                                 window.location.reload();
                             }, 1500);
@@ -41759,6 +43097,8 @@ Ihr Lieferteam',
                         }
 
                         if (data.success && data.data.latitude && data.data.longitude) {
+                            // Success! Reset retry counter
+                            locationRetryCount = 0;
                             currentDriverLat = parseFloat(data.data.latitude);
                             currentDriverLng = parseFloat(data.data.longitude);
                             routeCoordinates = data.data.route_coordinates || [];
@@ -41771,21 +43111,107 @@ Ihr Lieferteam',
                                 document.getElementById('stops-before').textContent = data.data.stops_before;
                             }
 
+                            // Hide error message if visible
+                            hideLocationError();
+
                             // Update ETA with multi-stop OSRM routing
                             updateMapAndETA();
                         } else {
-                            console.warn('No valid driver location data');
-                            document.getElementById('eta-display').textContent = 'Standort nicht verfügbar';
+                            console.warn('No valid driver location data:', data);
+                            handleLocationError('no_data');
                         }
 
-                        // Update last update time after successful or failed update
                         updateLastUpdateTime();
                     })
                     .catch(error => {
                         console.error('Error loading driver location:', error);
-                        document.getElementById('eta-display').textContent = 'Fehler beim Laden';
+                        handleLocationError('network', error.message);
                         updateLastUpdateTime();
                     });
+                }
+
+                // v2.9.92: Handle location errors with retry
+                function handleLocationError(errorType, errorDetails = '') {
+                    locationRetryCount++;
+                    const etaDisplay = document.getElementById('eta-display');
+
+                    if (locationRetryCount < maxRetries) {
+                        // Retry after delay
+                        console.log('Retrying in ' + retryDelay + 'ms (attempt ' + (locationRetryCount + 1) + ')');
+                        setTimeout(() => updateDriverLocation(true), retryDelay);
+                        return;
+                    }
+
+                    // Max retries reached - show helpful error
+                    console.warn('Max retries reached, showing error to user');
+                    
+                    if (errorType === 'network') {
+                        etaDisplay.textContent = 'Verbindungsproblem';
+                    } else {
+                        etaDisplay.textContent = 'Standort nicht verfügbar';
+                    }
+
+                    showLocationError(errorType, errorDetails);
+                }
+
+                // v2.9.92: Show error message with tips
+                function showLocationError(errorType, errorDetails) {
+                    // Remove existing error box if any
+                    hideLocationError();
+
+                    const errorBox = document.createElement('div');
+                    errorBox.id = 'location-error-box';
+                    errorBox.style.cssText = 'background: #fef3c7; border: 1px solid #f59e0b; border-radius: 8px; padding: 12px; margin: 15px 0; font-size: 13px;';
+                    
+                    let tips = '';
+                    if (errorType === 'network') {
+                        tips = `
+                            <p style="margin: 0 0 8px 0; font-weight: 600; color: #92400e;">⚠️ Verbindungsproblem</p>
+                            <p style="margin: 0 0 8px 0; color: #78350f;">Die Fahrer-Position konnte nicht geladen werden.</p>
+                            <ul style="margin: 8px 0; padding-left: 20px; color: #78350f;">
+                                <li>Prüfe deine Internetverbindung</li>
+                                <li>Deaktiviere Browser-Erweiterungen (Ad-Blocker)</li>
+                                <li>Deaktiviere Google Übersetzer</li>
+                            </ul>
+                        `;
+                    } else {
+                        tips = `
+                            <p style="margin: 0 0 8px 0; font-weight: 600; color: #92400e;">📍 Standort wird ermittelt</p>
+                            <p style="margin: 0 0 8px 0; color: #78350f;">Der Fahrer-Standort ist momentan nicht verfügbar.</p>
+                            <ul style="margin: 8px 0; padding-left: 20px; color: #78350f;">
+                                <li>Der Fahrer könnte gerade in einem Funkloch sein</li>
+                                <li>GPS-Signal wird gesucht</li>
+                            </ul>
+                        `;
+                    }
+
+                    errorBox.innerHTML = tips + `
+                        <button onclick="manualRefresh()" style="background: #f59e0b; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: 500; margin-top: 8px;">
+                            🔄 Erneut versuchen
+                        </button>
+                    `;
+
+                    // Insert after ETA card
+                    const etaCard = document.querySelector('.eta-card');
+                    if (etaCard && etaCard.parentNode) {
+                        etaCard.parentNode.insertBefore(errorBox, etaCard.nextSibling);
+                    }
+                }
+
+                // v2.9.92: Hide error message
+                function hideLocationError() {
+                    const existingError = document.getElementById('location-error-box');
+                    if (existingError) {
+                        existingError.remove();
+                    }
+                }
+
+                // v2.9.92: Manual refresh button handler
+                function manualRefresh() {
+                    hideLocationError();
+                    document.getElementById('eta-display').textContent = 'Wird berechnet...';
+                    locationRetryCount = 0;
+                    updateDriverLocation();
                 }
 
                 // ✅ FIX v2.9.63: OSRM used for both frontend AND backend routing (100% free!)
@@ -41859,9 +43285,10 @@ Ihr Lieferteam',
 
                     console.log('Building route with waypoints:', waypoints);
 
-                    // Fetch multi-stop route from OSRM
+                    // Fetch multi-stop route from OSRM (use configured server with public fallback)
                     try {
-                        const osrmUrl = `https://router.project-osrm.org/route/v1/driving/${waypoints.join(';')}?overview=full&geometries=geojson&steps=true`;
+                        const osrmBase = '<?php echo rtrim(esc_url(get_option("dispatch_osrm_api_url", "https://router.project-osrm.org")), "/"); ?>';
+                        const osrmUrl = `${osrmBase}/route/v1/driving/${waypoints.join(';')}?overview=full&geometries=geojson&steps=true`;
 
                         const response = await fetch(osrmUrl);
                         const data = await response.json();
@@ -43324,6 +44751,314 @@ Ihr Lieferteam',
         ]);
     }
 
+    /**
+     * AJAX: Create Nachlieferung (Follow-up delivery) for missing items
+     * Creates a new WooCommerce order with status 'nachlieferung' and €0 total
+     * Sends customer notification email
+     */
+    public function ajaxCreateNachlieferung(): void {
+        // Get parameters
+        $order_id = intval($_POST['order_id'] ?? 0);
+        $missing_items_json = stripslashes($_POST['missing_items'] ?? '[]');
+        $comment = sanitize_textarea_field($_POST['comment'] ?? '');
+
+        // Validate order ID
+        if (!$order_id) {
+            wp_send_json_error(['message' => 'Ungültige Bestell-ID']);
+            return;
+        }
+
+        // Get original order
+        $original_order = wc_get_order($order_id);
+        if (!$original_order) {
+            wp_send_json_error(['message' => 'Originalbestellung nicht gefunden']);
+            return;
+        }
+
+        // Parse missing items
+        $missing_items = json_decode($missing_items_json, true);
+        if (empty($missing_items) || !is_array($missing_items)) {
+            wp_send_json_error(['message' => 'Keine fehlenden Artikel angegeben']);
+            return;
+        }
+
+        try {
+            // Create new order for Nachlieferung
+            $new_order = wc_create_order([
+                'customer_id' => $original_order->get_customer_id(),
+                'status' => 'nachlieferung',
+            ]);
+
+            if (is_wp_error($new_order)) {
+                wp_send_json_error(['message' => 'Fehler beim Erstellen der Bestellung: ' . $new_order->get_error_message()]);
+                return;
+            }
+
+            // Copy billing and shipping addresses from original order
+            $new_order->set_billing_first_name($original_order->get_billing_first_name());
+            $new_order->set_billing_last_name($original_order->get_billing_last_name());
+            $new_order->set_billing_company($original_order->get_billing_company());
+            $new_order->set_billing_address_1($original_order->get_billing_address_1());
+            $new_order->set_billing_address_2($original_order->get_billing_address_2());
+            $new_order->set_billing_city($original_order->get_billing_city());
+            $new_order->set_billing_state($original_order->get_billing_state());
+            $new_order->set_billing_postcode($original_order->get_billing_postcode());
+            $new_order->set_billing_country($original_order->get_billing_country());
+            $new_order->set_billing_email($original_order->get_billing_email());
+            $new_order->set_billing_phone($original_order->get_billing_phone());
+
+            $new_order->set_shipping_first_name($original_order->get_shipping_first_name());
+            $new_order->set_shipping_last_name($original_order->get_shipping_last_name());
+            $new_order->set_shipping_company($original_order->get_shipping_company());
+            $new_order->set_shipping_address_1($original_order->get_shipping_address_1());
+            $new_order->set_shipping_address_2($original_order->get_shipping_address_2());
+            $new_order->set_shipping_city($original_order->get_shipping_city());
+            $new_order->set_shipping_state($original_order->get_shipping_state());
+            $new_order->set_shipping_postcode($original_order->get_shipping_postcode());
+            $new_order->set_shipping_country($original_order->get_shipping_country());
+
+            // Copy delivery date if exists
+            $delivery_date = $original_order->get_meta('_delivery_date');
+            if ($delivery_date) {
+                $new_order->update_meta_data('_delivery_date', $delivery_date);
+            }
+
+            $delivery_time = $original_order->get_meta('_delivery_time');
+            if ($delivery_time) {
+                $new_order->update_meta_data('_delivery_time', $delivery_time);
+            }
+
+            // Add missing items to new order (with €0 price)
+            $items_summary = [];
+            foreach ($missing_items as $item) {
+                $product_id = intval($item['product_id']);
+                $quantity = intval($item['missing_qty']);
+                $product = wc_get_product($product_id);
+
+                if ($product) {
+                    // Add product with 0 price
+                    $item_id = $new_order->add_product($product, $quantity, [
+                        'subtotal' => 0,
+                        'total' => 0,
+                    ]);
+
+                    // Add note about original quantity
+                    if ($item_id) {
+                        wc_add_order_item_meta($item_id, '_nachlieferung_original_qty', $item['ordered_qty']);
+                        wc_add_order_item_meta($item_id, '_nachlieferung_delivered_qty', $item['delivered_qty']);
+                    }
+
+                    $items_summary[] = $quantity . 'x ' . $product->get_name();
+                } else {
+                    // Product not found, add as custom line item
+                    $item_id = $new_order->add_item(new WC_Order_Item_Product());
+                    $order_item = $new_order->get_item($item_id);
+                    if ($order_item) {
+                        $order_item->set_name($item['name'] ?? 'Unbekanntes Produkt');
+                        $order_item->set_quantity($quantity);
+                        $order_item->set_subtotal(0);
+                        $order_item->set_total(0);
+                        $order_item->save();
+                    }
+                    $items_summary[] = $quantity . 'x ' . ($item['name'] ?? 'Unbekanntes Produkt');
+                }
+            }
+
+            // Set order totals to 0
+            $new_order->set_total(0);
+
+            // Link to original order
+            $new_order->update_meta_data('_nachlieferung_original_order', $order_id);
+            $new_order->update_meta_data('_nachlieferung_reason', $comment);
+            $new_order->update_meta_data('_already_paid', 'yes');
+
+            // Add order notes
+            $driver = get_userdata(get_current_user_id());
+            $driver_name = $driver ? $driver->display_name : 'System';
+
+            $new_order->add_order_note(sprintf(
+                'Nachlieferung erstellt von %s für Bestellung #%d. Fehlende Artikel: %s. %s',
+                $driver_name,
+                $order_id,
+                implode(', ', $items_summary),
+                $comment ? 'Kommentar: ' . $comment : ''
+            ));
+
+            // Add note to original order
+            $original_order->add_order_note(sprintf(
+                'Nachlieferung #%d erstellt. Fehlende Artikel: %s. %s',
+                $new_order->get_id(),
+                implode(', ', $items_summary),
+                $comment ? 'Kommentar: ' . $comment : ''
+            ));
+            $original_order->save();
+
+            // Save new order
+            $new_order->save();
+
+            // Send customer email notification
+            $this->sendNachlieferungEmail($new_order, $original_order, $missing_items, $comment);
+
+            wp_send_json_success([
+                'message' => 'Nachlieferung erfolgreich erstellt',
+                'new_order_id' => $new_order->get_id(),
+                'items_count' => count($missing_items)
+            ]);
+
+        } catch (Exception $e) {
+            wp_send_json_error(['message' => 'Fehler: ' . $e->getMessage()]);
+        }
+    }
+
+    /**
+     * Send email notification for Nachlieferung
+     */
+    private function sendNachlieferungEmail($new_order, $original_order, $missing_items, $comment): void {
+        $to = $original_order->get_billing_email();
+        if (empty($to)) {
+            return;
+        }
+
+        $customer_name = $original_order->get_billing_first_name();
+        $original_order_number = $original_order->get_order_number();
+        $new_order_number = $new_order->get_order_number();
+
+        // Build items table
+        $items_html = '<table style="width: 100%; border-collapse: collapse; margin: 20px 0;">';
+        $items_html .= '<tr style="background: #f5f5f5;"><th style="padding: 10px; text-align: left; border: 1px solid #ddd;">Artikel</th><th style="padding: 10px; text-align: center; border: 1px solid #ddd;">Menge</th></tr>';
+
+        foreach ($missing_items as $item) {
+            $items_html .= sprintf(
+                '<tr><td style="padding: 10px; border: 1px solid #ddd;">%s</td><td style="padding: 10px; text-align: center; border: 1px solid #ddd;">%d</td></tr>',
+                esc_html($item['name']),
+                intval($item['missing_qty'])
+            );
+        }
+        $items_html .= '</table>';
+
+        $subject = sprintf('Nachlieferung zu Ihrer Bestellung #%s', $original_order_number);
+
+        $message = sprintf('
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                <h2 style="color: #333;">Hallo %s,</h2>
+
+                <p>bei der Lieferung Ihrer Bestellung <strong>#%s</strong> konnten leider nicht alle Artikel geliefert werden.</p>
+
+                <p>Wir haben daher eine <strong>kostenlose Nachlieferung</strong> für Sie erstellt:</p>
+
+                <div style="background: #fff3cd; border: 1px solid #ffc107; border-radius: 8px; padding: 15px; margin: 20px 0;">
+                    <strong style="color: #856404;">📦 Nachlieferung #%s</strong><br>
+                    <span style="color: #28a745; font-weight: bold;">✓ Bereits bezahlt - Keine weiteren Kosten</span>
+                </div>
+
+                <h3 style="color: #333;">Folgende Artikel werden nachgeliefert:</h3>
+                %s
+
+                %s
+
+                <p>Wir werden Sie kontaktieren, um einen Liefertermin zu vereinbaren.</p>
+
+                <p>Wir entschuldigen uns für die Unannehmlichkeiten und danken Ihnen für Ihr Verständnis.</p>
+
+                <p>Mit freundlichen Grüßen,<br>
+                <strong>Ihr Lieferteam</strong></p>
+            </div>
+        ',
+            esc_html($customer_name),
+            esc_html($original_order_number),
+            esc_html($new_order_number),
+            $items_html,
+            $comment ? '<p><strong>Hinweis vom Fahrer:</strong> ' . esc_html($comment) . '</p>' : ''
+        );
+
+        // Get WooCommerce email header and footer
+        $mailer = WC()->mailer();
+        $email_heading = 'Nachlieferung zu Ihrer Bestellung';
+
+        $wrapped_message = $mailer->wrap_message($email_heading, $message);
+
+        // Send email
+        $headers = ['Content-Type: text/html; charset=UTF-8'];
+
+        wp_mail($to, $subject, $wrapped_message, $headers);
+    }
+
+    /**
+     * AJAX Handler - Nicht geliefert (Not Delivered)
+     * Removes driver assignment and returns order to dispatch
+     */
+    public function ajaxNichtGeliefert(): void {
+        // Get parameters
+        $order_id = intval($_POST['order_id'] ?? 0);
+        $reason = sanitize_text_field($_POST['reason'] ?? '');
+        $comment = sanitize_textarea_field($_POST['comment'] ?? '');
+
+        // Validate order ID
+        if (!$order_id) {
+            wp_send_json_error(['message' => 'Ungültige Bestell-ID']);
+            return;
+        }
+
+        // Get order
+        $order = wc_get_order($order_id);
+        if (!$order) {
+            wp_send_json_error(['message' => 'Bestellung nicht gefunden']);
+            return;
+        }
+
+        // Validate reason
+        $valid_reasons = [
+            'kunde_nicht_angetroffen' => 'Kunde nicht angetroffen',
+            'lieferung_verweigert' => 'Lieferung verweigert',
+            'falsche_adresse' => 'Falsche Adresse'
+        ];
+
+        if (!isset($valid_reasons[$reason])) {
+            wp_send_json_error(['message' => 'Ungültiger Grund']);
+            return;
+        }
+
+        $reason_text = $valid_reasons[$reason];
+
+        try {
+            // Get current driver info for the note
+            $driver = get_userdata(get_current_user_id());
+            $driver_name = $driver ? $driver->display_name : 'System';
+
+            // Remove driver assignment
+            $order->delete_meta_data('_assigned_driver');
+            $order->delete_meta_data('_delivery_sequence');
+
+            // Store nicht geliefert info
+            $order->update_meta_data('_nicht_geliefert', 'yes');
+            $order->update_meta_data('_nicht_geliefert_reason', $reason);
+            $order->update_meta_data('_nicht_geliefert_comment', $comment);
+            $order->update_meta_data('_nicht_geliefert_time', current_time('mysql'));
+            $order->update_meta_data('_nicht_geliefert_driver', $driver_name);
+
+            // Add order note
+            $note = sprintf(
+                '❌ Nicht geliefert - %s | Fahrer: %s%s',
+                $reason_text,
+                $driver_name,
+                $comment ? ' | Kommentar: ' . $comment : ''
+            );
+            $order->add_order_note($note);
+
+            // Save changes
+            $order->save();
+
+            wp_send_json_success([
+                'message' => 'Bestellung als nicht geliefert markiert',
+                'order_id' => $order_id,
+                'reason' => $reason_text
+            ]);
+
+        } catch (Exception $e) {
+            wp_send_json_error(['message' => 'Fehler: ' . $e->getMessage()]);
+        }
+    }
+
     public function ajaxSavePushSubscription(): void {
         Dispatch_Security::verify_driver_access(true);
 
@@ -43648,6 +45383,32 @@ Ihr Lieferteam',
             }
             return $actions;
         }, 10, 2);
+    }
+
+    /**
+     * Register custom order status "Nachlieferung" (Follow-up delivery)
+     */
+    public function registerNachlieferungOrderStatus(): void {
+        register_post_status('wc-nachlieferung', [
+            'label' => 'Nachlieferung',
+            'public' => true,
+            'show_in_admin_status_list' => true,
+            'show_in_admin_all_list' => true,
+            'exclude_from_search' => false,
+            'label_count' => _n_noop('Nachlieferung <span class="count">(%s)</span>', 'Nachlieferung <span class="count">(%s)</span>')
+        ]);
+
+        // Add to WooCommerce order statuses
+        add_filter('wc_order_statuses', function($order_statuses) {
+            $order_statuses['wc-nachlieferung'] = 'Nachlieferung';
+            return $order_statuses;
+        });
+
+        // Add custom status to bulk actions
+        add_filter('bulk_actions-edit-shop_order', function($bulk_actions) {
+            $bulk_actions['mark_nachlieferung'] = 'Status auf Nachlieferung ändern';
+            return $bulk_actions;
+        });
     }
 
     /**
@@ -44730,6 +46491,13 @@ Ihr Lieferteam',
             </div>
         </div>
         <?php
+    }
+
+    /**
+     * Log notification for daily report
+     */
+    private function logNotification($type, $event, $order_id, $recipient, $recipient_name, $success, $message = '', $error = '') {
+        dispatch_log_notification($type, $event, $order_id, $recipient, $recipient_name, $success, $message, $error);
     }
 
 } // Ende der DispatchDashboard Klasse
