@@ -4,6 +4,70 @@ Alle wichtigen Änderungen am Dispatch SECURE Plugin werden hier dokumentiert.
 
 ---
 
+## [2.9.88] - 2026-01-15
+
+### Bestellungen ohne Lieferdatum -> Unvollständig
+
+#### Problem
+- Bestellungen ohne Lieferdatum wurden als "aktuelle Aufträge" gezählt
+- Tab zeigte z.B. "3 aktuelle", Tabelle nur "1" (Diskrepanz)
+- Betroffene Bestellungen: #78148 (Poujeh Tiemann), #78054 (Ines Müller)
+
+#### Ursache
+- `getOrderCount('current')` zählte: Lieferdatum = heute **ODER kein Datum**
+- `ajaxGetOrders` filterte: **NUR** Lieferdatum = heute
+- Unterschiedliche Logik führte zu Inkonsistenz
+
+#### Lösung
+
+**1. getOrderCount('current') - Zeile 4837:**
+```php
+// ALT: Include if delivery date = today OR no date
+if (empty($delivery_date) || ...)
+
+// NEU: Include ONLY if delivery date = today (no date = incomplete!)
+if (!empty($delivery_date)) {
+    if ($delivery_date === $today_ymd || ...)
+}
+```
+
+**2. getOrderCount('incomplete') - Zeile 4874:**
+```php
+// ALT: Include only if delivery date is PAST
+if (!empty($delivery_date)) { ... }
+
+// NEU: Include if NO date OR date is PAST
+if (empty($delivery_date)) {
+    $is_incomplete = true;  // Kein Datum = Unvollständig
+} else {
+    // Vergangenheit prüfen
+}
+```
+
+**3. ajaxGetOrders incomplete Filter - Zeile 4258:**
+```php
+// Gleiche Logik wie getOrderCount
+if (empty($delivery_date)) {
+    $is_incomplete = true;
+} else {
+    // Vergangenheit prüfen
+}
+```
+
+#### Ergebnis
+| Tab | Vorher | Nachher |
+|-----|--------|---------|
+| aktuelle Aufträge | 3 | **1** |
+| Unvollständige | 0 | **2** |
+
+#### Geänderte Dateien
+- `dispatch-dashboard.php`:
+  - Zeile 4837-4852: getOrderCount current Filter
+  - Zeile 4874-4887: getOrderCount incomplete Filter
+  - Zeile 4258-4281: ajaxGetOrders incomplete Filter
+
+---
+
 ## [2.9.87] - 2026-01-15
 
 ### Navigation: Plus Code Priorisierung im Fahrer-Dashboard
